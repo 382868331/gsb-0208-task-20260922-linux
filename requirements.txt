@@ -1,1 +1,2 @@
-# Python 3.14.7 standard library only.
+# 无第三方依赖：本题库、测试与 demo 仅使用 Python 3.14.7 标准库。
+# 安装 Python 后无需 pip install 任何包即可运行测试与演示。
