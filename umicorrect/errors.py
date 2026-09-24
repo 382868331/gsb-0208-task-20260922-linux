@@ -24,7 +24,18 @@ class InvalidArgumentError(UMICorrectError, ValueError):
 
 
 class InvalidReadError(UMICorrectError, ValueError):
-    """批次中某条读段非法。消息带 ``reads[i]`` 形式的可定位前缀。"""
+    """批次中某条读段非法。消息带 ``reads[i]`` / ``records[i]`` 形式的
+    可定位前缀。"""
+
+
+class RecordConflictError(InvalidArgumentError):
+    """记录级冲突：同一 ``record_id`` 在批次中重复出现。
+
+    分子级重复（不同 ``record_id``、规范化键相同）是合法的 PCR 重复，
+    进入成对分组与共识；**记录级重复**（同一 ID 二次投递）无法由库判断
+    是“重发”还是“两条不同观测误用同号”，因此一律显式拒绝，绝不静默
+    去重或合并。消息给出两次出现的批次下标。
+    """
 
 
 class LimitExceededError(UMICorrectError):
