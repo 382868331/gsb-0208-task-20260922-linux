@@ -45,9 +45,11 @@
 from __future__ import annotations
 
 import math
+import types
 from dataclasses import dataclass
 
 from .errors import (
+    DuplicateRecordError,
     InvalidArgumentError,
     InvalidReadError,
     LimitExceededError,
@@ -56,23 +58,35 @@ from .errors import (
 
 __all__ = [
     "Read",
+    "TaggedRead",
     "Molecule",
+    "TaggedMolecule",
     "Cluster",
     "AnalysisResult",
+    "TaggedAnalysisResult",
     "DEFAULT_PROBE_BUDGET",
     "MAX_UMI_LENGTH",
     "MAX_READ_LENGTH",
     "MAX_READS",
     "MIN_UMI_LENGTH",
     "MIN_READ_LENGTH",
+    "MIN_COORDINATE",
+    "MAX_COORDINATE",
+    "STRANDS",
     "BASES",
+    "reverse_complement",
     "cluster_umis",
     "consensus",
     "analyze_reads",
+    "analyze_tagged_reads",
 ]
 
 BASES = ("A", "C", "G", "T")
 _BASE_INDEX = {"A": 0, "C": 1, "G": 2, "T": 3}
+_COMPLEMENT = {"A": "T", "C": "G", "G": "C", "T": "A"}
+
+# 链方向：'+' 正链（序列方向与基因组正链一致），'-' 反链。
+STRANDS = ("+", "-")
 
 # ---- 公开输入上限（接口边界；短演示不必触及） -----------------------------
 MIN_UMI_LENGTH = 1
@@ -80,6 +94,10 @@ MAX_UMI_LENGTH = 32
 MIN_READ_LENGTH = 1
 MAX_READ_LENGTH = 1000
 MAX_READS = 1_000_000
+# 基因组坐标：非负 32 位有符号整数上界（0-based/1-based 由调用方约定，
+# 本库只做相等性与分组，不解释坐标体系）。
+MIN_COORDINATE = 0
+MAX_COORDINATE = 2_147_483_647
 # Hamming 邻居探测次数预算 = 需要评估的有向节点对数（上界 K(K-1)/2）。
 # 默认 2e8 覆盖约 2 万个去重 UMI 的最坏两两比较；典型 UMI 数据邻接稀疏，
 # 实际探测远少于此。更大 K 需显式放大预算，耗尽时报错而非截断结果。
@@ -161,6 +179,78 @@ class AnalysisResult:
     @property
     def merged_count(self) -> int:
         """吸收操作合并掉的 UMI 种数（= 合并前分子数 - 合并后分子数）。"""
+        return self.nodes_before - self.molecules_after
+
+
+# ---------------------------------------------------------------------------
+# 双端 UMI + 坐标 + 链方向（本次迭代新增）
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TaggedRead:
+    """带分子标签（双端 UMI、基因组坐标、链方向）与记录 ID 的读段。
+
+    Attributes:
+        umi1/umi2: 读段两端的等长 UMI（仅 A/C/G/T，长度 1..32）。
+        coordinate: 基因组坐标（整数 0..2^31-1）；本库只做相等性与分组，
+            不解释 0-based/1-based 体系。
+        strand: ``'+'`` 正链或 ``'-'`` 反链。``'-'`` 记录的 UMI 与序列按
+            反向互补规范化到正链坐标空间，原始链身份保留在 strand 字段。
+        sequence/qualities: 与单端 :class:`Read` 相同契约的等长读段。
+        record_id: 调用方提供的稳定记录标识（非空 str）。同一 ID 重复出现
+            时内容必须完全一致，否则抛 :class:`DuplicateRecordError`。
+    """
+
+    umi1: str
+    umi2: str
+    coordinate: int
+    strand: str
+    sequence: str
+    qualities: tuple[int, ...]
+    record_id: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.qualities, list):
+            object.__setattr__(self, "qualities", tuple(self.qualities))
+        _check_tagged_fields(self)
+
+
+@dataclass(frozen=True)
+class TaggedMolecule:
+    """双端标签分子：在 (坐标, 链) 分区内按规范化双端 UMI 吸收得到。
+
+    Attributes:
+        root_umi: 簇根的规范化双端 UMI（``umi1 + "|" + umi2``，正链空间）。
+        members: 成员规范化双端 UMI（含根，字典序升序）。
+        record_ids: 成员读段的记录 ID（按下标升序）。
+        read_indices: 去重后成员记录在输入批次中的下标（升序）。
+        coordinate / strand: 该分子所属的坐标与链身份（链身份**不**合并）。
+        consensus_seq / confidence_gap: 同 :class:`Molecule`（正链空间）。
+    """
+
+    root_umi: str
+    members: tuple[str, ...]
+    record_ids: tuple[str, ...]
+    read_indices: tuple[int, ...]
+    coordinate: int
+    strand: str
+    consensus_seq: str
+    confidence_gap: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class TaggedAnalysisResult:
+    """双端标签批次结果。分子按 (coordinate, strand, 读段数降序, root_umi) 排。"""
+
+    molecules: tuple[TaggedMolecule, ...]
+    umi_length: int
+    read_length: int
+    nodes_before: int
+    molecules_after: int
+    duplicates_removed: int
+
+    @property
+    def merged_count(self) -> int:
+        """吸收合并掉的双端 UMI 种数。"""
         return self.nodes_before - self.molecules_after
 
 
@@ -305,9 +395,90 @@ def _group_by_umi(reads) -> dict[str, list[int]]:
     return groups
 
 
+def reverse_complement(seq: str) -> str:
+    """返回 DNA 串的反向互补（仅 A/C/G/T）。
+
+    用于把 ``'-'`` 反链记录的 UMI / 序列规范化到正链空间：先互补再反转，
+    等价于反链读段在正链坐标下的碱基排列。调用前调用方已保证字母表合法。
+    """
+    return "".join(_COMPLEMENT[ch] for ch in reversed(seq))
+
+
 # ---------------------------------------------------------------------------
 # 第二步：错误吸收聚类
 # ---------------------------------------------------------------------------
+def _cluster_validated_counts(
+    umi_counts: dict[str, int],
+    *,
+    probe_budget: int,
+    probes_used: int = 0,
+) -> tuple[tuple[Cluster, ...], int]:
+    """对“已校验”的 UMI->计数 表执行吸收图构建与归属（旧聚类入口的核心）。
+
+    与 :func:`cluster_umis` 的区别：不再检查键的字母表/长度/计数，供双端
+    UMI（组合键最长 2*32+1=65 字符）等内部调用复用同一吸收规则。
+    ``probes_used`` 为跨多个坐标/链分区累计的已用探测预算；返回
+    ``(clusters, 新的累计 probes_used)``。
+    """
+    # count 降序、再 UMI 字典序升序 —— 全局确定全序
+    ordered = sorted(umi_counts, key=lambda u: (-umi_counts[u], u))
+
+    # ---- 构造有向边 u -> v（u 在全序中先于 v）----
+    # adjacency[u] 按全序排列，保证 BFS 确定性。
+    probes = probes_used
+    adjacency: dict[str, list[str]] = {u: [] for u in ordered}
+    for ai in range(len(ordered)):
+        u = ordered[ai]
+        cu = umi_counts[u]
+        for bi in range(ai + 1, len(ordered)):
+            v = ordered[bi]
+            probes += 1
+            if probes > probe_budget:
+                raise SearchBudgetExhaustedError(
+                    f"Hamming 邻居探测预算耗尽（已用 {probes}，预算 {probe_budget}）；"
+                    "吸收结果未知，请放大 probe_budget 后重算",
+                    probes_used=probes,
+                    budget=probe_budget,
+                )
+            if _hamming1(u, v) and cu >= 2 * umi_counts[v] - 1:
+                adjacency[u].append(v)
+
+    # ---- 按全序建立根，沿有向边确定性 BFS 传递吸收 ----
+    # owner[u]：u 已归属的根；None 表示未归属。
+    owner: dict[str, str | None] = {u: None for u in ordered}
+    members: dict[str, list[str]] = {}
+
+    for root in ordered:
+        if owner[root] is not None:
+            continue  # 已被更早（更高）的根可达并吸收
+        owner[root] = root
+        mine = [root]
+        queue = [root]
+        head = 0
+        while head < len(queue):
+            u = queue[head]
+            head += 1
+            for v in adjacency[u]:  # 已按全序排列
+                if owner[v] is None:
+                    owner[v] = root
+                    mine.append(v)
+                    queue.append(v)
+        members[root] = mine
+
+    clusters: list[Cluster] = []
+    for root, mem in members.items():
+        clusters.append(
+            Cluster(
+                root=root,
+                members=tuple(sorted(mem)),
+                root_count=umi_counts[root],
+                total_count=sum(umi_counts[u] for u in mem),
+            )
+        )
+    clusters.sort(key=lambda c: (-c.total_count, c.root))
+    return tuple(clusters), probes
+
+
 def cluster_umis(
     umi_counts: dict[str, int],
     *,
@@ -359,63 +530,8 @@ def cluster_umis(
     if not umi_counts:
         return ()
 
-    # count 降序、再 UMI 字典序升序 —— 全局确定全序
-    ordered = sorted(umi_counts, key=lambda u: (-umi_counts[u], u))
-
-    # ---- 构造有向边 u -> v（u 在全序中先于 v）----
-    # adjacency[u] 按全序排列，保证 BFS 确定性。
-    probes = 0
-    adjacency: dict[str, list[str]] = {u: [] for u in ordered}
-    for ai in range(len(ordered)):
-        u = ordered[ai]
-        cu = umi_counts[u]
-        for bi in range(ai + 1, len(ordered)):
-            v = ordered[bi]
-            probes += 1
-            if probes > probe_budget:
-                raise SearchBudgetExhaustedError(
-                    f"Hamming 邻居探测预算耗尽（已用 {probes}，预算 {probe_budget}）；"
-                    "吸收结果未知，请放大 probe_budget 后重算",
-                    probes_used=probes,
-                    budget=probe_budget,
-                )
-            if _hamming1(u, v) and cu >= 2 * umi_counts[v] - 1:
-                adjacency[u].append(v)
-
-    # ---- 按全序建立根，沿有向边确定性 BFS 传递吸收 ----
-    # owner[u]：u 已归属的根；None 表示未归属。
-    owner: dict[str, str | None] = {u: None for u in ordered}
-    members: dict[str, list[str]] = {}
-
-    for root in ordered:
-        if owner[root] is not None:
-            continue  # 已被更早（更高）的根可达并吸收
-        owner[root] = root
-        mine = [root]
-        queue = [root]
-        head = 0
-        while head < len(queue):
-            u = queue[head]
-            head += 1
-            for v in adjacency[u]:  # 已按全序排列
-                if owner[v] is None:
-                    owner[v] = root
-                    mine.append(v)
-                    queue.append(v)
-        members[root] = mine
-
-    clusters: list[Cluster] = []
-    for root, mem in members.items():
-        clusters.append(
-            Cluster(
-                root=root,
-                members=tuple(sorted(mem)),
-                root_count=umi_counts[root],
-                total_count=sum(umi_counts[u] for u in mem),
-            )
-        )
-    clusters.sort(key=lambda c: (-c.total_count, c.root))
-    return tuple(clusters)
+    clusters, _ = _cluster_validated_counts(umi_counts, probe_budget=probe_budget)
+    return clusters
 
 
 def _hamming1(a: str, b: str) -> bool:
@@ -561,4 +677,271 @@ def analyze_reads(
         read_length=read_len,
         nodes_before=nodes_before,
         molecules_after=len(molecules),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 双端 UMI + 坐标 + 链方向管线（本次迭代新增）
+# ---------------------------------------------------------------------------
+_DUAL_KEY_SEP = "|"
+
+
+def _check_umi_str(value, field: str) -> None:
+    """校验单个 UMI 字段：非空 str、长度上限、A/C/G/T 字母表。"""
+    if not isinstance(value, str):
+        raise InvalidArgumentError(f"{field} 必须是 str，得到 {type(value).__name__}")
+    if not value:
+        raise InvalidArgumentError(f"{field} 为空串：UMI 长度必须 >= {MIN_UMI_LENGTH}")
+    if len(value) > MAX_UMI_LENGTH:
+        raise LimitExceededError(f"{field} 长度 {len(value)} 超过上限 {MAX_UMI_LENGTH}")
+    for j, ch in enumerate(value):
+        if ch not in _BASE_INDEX:
+            raise InvalidArgumentError(
+                f"{field}[{j}] = {ch!r} 非法，仅允许 A/C/G/T（拒绝 N/小写）"
+            )
+
+
+def _check_tagged_fields(rec: TaggedRead) -> None:
+    """单条 :class:`TaggedRead` 的字段级校验（构造期即调用）。"""
+    _check_umi_str(rec.umi1, "umi1")
+    _check_umi_str(rec.umi2, "umi2")
+    if len(rec.umi1) != len(rec.umi2):
+        raise InvalidArgumentError(
+            f"双端 UMI 长度必须相等：umi1 长度 {len(rec.umi1)} != umi2 长度 {len(rec.umi2)}"
+        )
+
+    coord = rec.coordinate
+    if isinstance(coord, bool) or not isinstance(coord, int):
+        raise InvalidArgumentError(
+            f"coordinate 必须是整数且不能是 bool，得到 {type(coord).__name__}"
+        )
+    if coord < MIN_COORDINATE or coord > MAX_COORDINATE:
+        raise InvalidArgumentError(
+            f"coordinate = {coord} 越界，允许范围 {MIN_COORDINATE}..{MAX_COORDINATE}"
+        )
+
+    if not isinstance(rec.strand, str) or rec.strand not in STRANDS:
+        raise InvalidArgumentError(
+            f"strand 必须是 '+' 或 '-'，得到 {rec.strand!r}"
+        )
+
+    if not isinstance(rec.record_id, str) or not rec.record_id:
+        raise InvalidArgumentError("record_id 必须是非空 str")
+
+    # 序列/质量沿用单端契约（双端 UMI 长度与读段长度不再要求相等）
+    seq = rec.sequence
+    qual = rec.qualities
+    if not isinstance(seq, str):
+        raise InvalidArgumentError(f"sequence 必须是 str，得到 {type(seq).__name__}")
+    if not isinstance(qual, tuple):
+        raise InvalidArgumentError(
+            f"qualities 必须是 tuple（或 list），得到 {type(qual).__name__}"
+        )
+    if not seq:
+        raise InvalidArgumentError(f"sequence 为空串：读段长度必须 >= {MIN_READ_LENGTH}")
+    if len(seq) > MAX_READ_LENGTH:
+        raise LimitExceededError(f"sequence 长度 {len(seq)} 超过上限 {MAX_READ_LENGTH}")
+    if len(qual) != len(seq):
+        raise InvalidArgumentError(
+            f"qualities 长度 {len(qual)} 与序列长度 {len(seq)} 不一致"
+        )
+    for j, ch in enumerate(seq):
+        if ch not in _BASE_INDEX:
+            raise InvalidArgumentError(
+                f"sequence[{j}] = {ch!r} 非法，仅允许 A/C/G/T（拒绝 N/小写）"
+            )
+    for j, q in enumerate(qual):
+        if isinstance(q, bool) or not isinstance(q, int):
+            if isinstance(q, float) and not isinstance(q, bool):
+                _reject_nonfinite(f"qualities[{j}]", q)
+            raise InvalidArgumentError(
+                f"qualities[{j}] 必须是 0..40 的整数且不能是 bool，得到 {type(q).__name__}"
+            )
+        if q < 0 or q > 40:
+            raise InvalidArgumentError(f"qualities[{j}] = {q} 越界，允许范围 0..40")
+
+
+def _validate_tagged_batch(records) -> tuple[int, int]:
+    """校验整个双端批次（先全部校验、后构建，失败不留部分状态）。
+
+    返回 (固定双端 UMI 长度, 固定读段长度)。错误消息带 ``records[i]`` 前缀。
+    """
+    if not isinstance(records, (list, tuple)):
+        raise InvalidArgumentError(
+            f"records 必须是 list/tuple，得到 {type(records).__name__}"
+        )
+    if len(records) > MAX_READS:
+        raise LimitExceededError(f"记录数 {len(records)} 超过上限 {MAX_READS}")
+    if len(records) == 0:
+        raise InvalidArgumentError(
+            "records 为空批次：无法确定固定 UMI/读段长度（空批次被拒绝）"
+        )
+
+    fixed_umi_len: int | None = None
+    fixed_read_len: int | None = None
+    for i, rec in enumerate(records):
+        if not isinstance(rec, TaggedRead):
+            raise InvalidReadError(
+                f"records[{i}] 必须是 TaggedRead，得到 {type(rec).__name__}"
+            )
+        try:
+            _check_tagged_fields(rec)
+        except InvalidArgumentError as exc:
+            raise InvalidReadError(f"records[{i}]: {exc}") from exc
+        if fixed_umi_len is None:
+            fixed_umi_len = len(rec.umi1)
+            fixed_read_len = len(rec.sequence)
+        else:
+            if len(rec.umi1) != fixed_umi_len:
+                raise InvalidReadError(
+                    f"records[{i}].umi 长度 {len(rec.umi1)} 与批次固定双端 UMI "
+                    f"长度 {fixed_umi_len} 不一致"
+                )
+            if len(rec.sequence) != fixed_read_len:
+                raise InvalidReadError(
+                    f"records[{i}].sequence 长度 {len(rec.sequence)} 与批次固定"
+                    f"读段长度 {fixed_read_len} 不一致"
+                )
+    assert fixed_umi_len is not None and fixed_read_len is not None
+    return fixed_umi_len, fixed_read_len
+
+
+# 参与 ID 冲突比较的字段（顺序即报错时“首个冲突字段”的报告顺序）
+_DUPLICATE_COMPARE_FIELDS = ("umi1", "umi2", "coordinate", "strand", "sequence", "qualities")
+
+
+def _dedup_by_id(records) -> list[int]:
+    """按 record_id 去重，返回保留记录（首次出现）在输入中的下标列表。
+
+    完全一致的重复提交按 ID 折叠（保留首次出现）；同 ID 内容冲突抛
+    :class:`DuplicateRecordError`，给出两次下标与首个冲突字段。
+    """
+    first_index: dict[str, int] = {}
+    kept: list[int] = []
+    for i, rec in enumerate(records):
+        if rec.record_id in first_index:
+            j = first_index[rec.record_id]
+            prior = records[j]
+            for field in _DUPLICATE_COMPARE_FIELDS:
+                if getattr(rec, field) != getattr(prior, field):
+                    raise DuplicateRecordError(
+                        f"records[{i}] 与 records[{j}] 的 record_id {rec.record_id!r} "
+                        f"重复但字段 {field!r} 冲突：{getattr(prior, field)!r} != "
+                        f"{getattr(rec, field)!r}（拒绝静默合并）"
+                    )
+            # 内容完全一致：重复提交，折叠到首次出现
+            continue
+        first_index[rec.record_id] = i
+        kept.append(i)
+    return kept
+
+
+def analyze_tagged_reads(
+    records,
+    *,
+    probe_budget: int = DEFAULT_PROBE_BUDGET,
+) -> TaggedAnalysisResult:
+    """双端 UMI + 坐标 + 链方向的规范化、成对与共识管线。
+
+    步骤：整批校验（原子失败）→ 按 ID 去重（冲突显式报错）→ 反链记录反向
+    互补规范化（保留链身份）→ 按 (coordinate, strand) 分区 → 分区内对规范化
+    双端 UMI 调用旧吸收聚类入口（:func:`cluster_umis` 的同一核心）→ 逐簇调用
+    旧共识入口 :func:`consensus`。
+
+    匹配规则（明确）：仅当两条记录坐标相同、**链相同**且规范化双端 UMI
+    恰好相差一个碱基（任一端），并满足旧的丰度阈值 ``c >= 2s - 1`` 时，才
+    可能被吸收到同一分子。坐标不同或链不同的记录永不成对。
+
+    Returns:
+        :class:`TaggedAnalysisResult`。
+    """
+    probe_budget = _strict_int("probe_budget", probe_budget)
+    if probe_budget < 0:
+        raise InvalidArgumentError("probe_budget 必须为非负整数")
+
+    # 1) 整批先校验（原子失败语义；失败前不构建任何结果）
+    umi_len, read_len = _validate_tagged_batch(records)
+
+    # 2) 按 record_id 去重 / 冲突检测（冲突同样整批拒绝）
+    kept = _dedup_by_id(records)
+    duplicates_removed = len(records) - len(kept)
+
+    # 3) 规范化：'-' 记录的双端 UMI 与序列反向互补到正链空间，质量随序列反转；
+    #    原始 strand 保留。组合键 n1 + "|" + n2，Hamming 恰为“任一端单碱基差”。
+    # partitions[(coord, strand)] = [(输入下标, 组合键, 规范化 seq, 规范化 qual), ...]
+    partitions: dict[tuple[int, str], list[tuple[int, str, str, tuple[int, ...]]]] = {}
+    for i in kept:
+        rec = records[i]
+        if rec.strand == "-":
+            n1 = reverse_complement(rec.umi1)
+            n2 = reverse_complement(rec.umi2)
+            nseq = reverse_complement(rec.sequence)
+            nqual = tuple(reversed(rec.qualities))
+        else:
+            n1, n2 = rec.umi1, rec.umi2
+            nseq, nqual = rec.sequence, rec.qualities
+        key = n1 + _DUAL_KEY_SEP + n2
+        partitions.setdefault((rec.coordinate, rec.strand), []).append(
+            (i, key, nseq, nqual)
+        )
+
+    # 4) 每个 (坐标, 链) 分区独立计数、吸收、共识；跨分区探测预算累计。
+    molecules: list[TaggedMolecule] = []
+    nodes_before = 0
+    probes = 0
+    for (coord, strand) in sorted(partitions, key=lambda cs: (cs[0], cs[1])):
+        entries = partitions[(coord, strand)]
+        counts: dict[str, int] = {}
+        for _, key, _, _ in entries:
+            counts[key] = counts.get(key, 0) + 1
+        nodes_before += len(counts)
+
+        clusters, probes = _cluster_validated_counts(
+            counts, probe_budget=probe_budget, probes_used=probes
+        )
+
+        # 组合键 -> 成员条目（保留首次出现顺序，共识按下标升序）
+        by_key: dict[str, list[tuple[int, str, tuple[int, ...]]]] = {}
+        for idx, key, nseq, nqual in entries:
+            by_key.setdefault(key, []).append((idx, nseq, nqual))
+
+        # 共识需要一个按下标可索引、带 .sequence/.qualities 的规范化读段视图；
+        # 视图与本分区条目对齐，read_indices 映射回输入批次下标。
+        view = [types.SimpleNamespace(sequence=nseq, qualities=nqual)
+                for _, _, nseq, nqual in entries]
+        entry_order = [idx for idx, _, _, _ in entries]
+        index_of = {idx: k for k, idx in enumerate(entry_order)}
+
+        for cl in clusters:
+            member_indices: list[int] = []
+            for key in cl.members:
+                for idx, _, _ in by_key[key]:
+                    member_indices.append(idx)
+            member_indices.sort()
+            member_ids = [records[idx].record_id for idx in member_indices]
+            view_indices = tuple(sorted(index_of[idx] for idx in member_indices))
+            seq, gaps = consensus(view, read_len, read_indices=view_indices)
+            molecules.append(
+                TaggedMolecule(
+                    root_umi=cl.root,
+                    members=cl.members,
+                    record_ids=tuple(member_ids),
+                    read_indices=tuple(member_indices),
+                    coordinate=coord,
+                    strand=strand,
+                    consensus_seq=seq,
+                    confidence_gap=gaps,
+                )
+            )
+
+    molecules.sort(
+        key=lambda m: (m.coordinate, m.strand, -len(m.read_indices), m.root_umi)
+    )
+    return TaggedAnalysisResult(
+        molecules=tuple(molecules),
+        umi_length=umi_len,
+        read_length=read_len,
+        nodes_before=nodes_before,
+        molecules_after=len(molecules),
+        duplicates_removed=duplicates_removed,
     )
