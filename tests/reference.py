@@ -86,3 +86,45 @@ def reference_consensus(
             seq.append(BASES[winners[0]])
             gaps.append(ordered_vals[0] - ordered_vals[1])
     return "".join(seq), gaps
+
+
+def reference_positioned_consensus(
+    reads: list, indices: list[int]
+) -> tuple[int, str, list, list]:
+    """定位共识的独立参考：逐读段按参考坐标直接累加对数似然。
+
+    返回 (ref_start, 共识, 逐位置 gap 或 None, 逐位置覆盖数)。
+    空洞（覆盖数 0）输出 'N' 且 gap 为 None；并列输出 'N' 且 gap 0.0。
+    """
+    ref_start = min(reads[i].start for i in indices)
+    ref_end = max(reads[i].start + len(reads[i].sequence) for i in indices)
+    n = ref_end - ref_start
+    lls = [[0.0, 0.0, 0.0, 0.0] for _ in range(n)]
+    cov = [0] * n
+    for i in indices:
+        r = reads[i]
+        for j, called in enumerate(r.sequence):
+            p = r.start - ref_start + j
+            cov[p] += 1
+            err = 10.0 ** (-r.qualities[j] / 10.0)
+            for bi, b in enumerate(BASES):
+                p_true = (1.0 - err) if b == called else err / 3.0
+                lls[p][bi] += float("-inf") if p_true == 0.0 else math.log10(p_true)
+
+    seq = []
+    gaps = []
+    for p, row in enumerate(lls):
+        if cov[p] == 0:
+            seq.append("N")
+            gaps.append(None)
+            continue
+        best_val = max(row)
+        winners = [bi for bi, v in enumerate(row) if v == best_val]
+        if len(winners) > 1:
+            seq.append("N")
+            gaps.append(0.0)
+        else:
+            ordered_vals = sorted(row, reverse=True)
+            seq.append(BASES[winners[0]])
+            gaps.append(ordered_vals[0] - ordered_vals[1])
+    return ref_start, "".join(seq), gaps, cov

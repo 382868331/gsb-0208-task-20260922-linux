@@ -17,8 +17,10 @@ import time
 
 from umicorrect import (
     InvalidArgumentError,
+    PositionedRead,
     Read,
     SearchBudgetExhaustedError,
+    analyze_positioned_reads,
     analyze_reads,
 )
 
@@ -96,6 +98,42 @@ def main() -> None:
     except SearchBudgetExhaustedError as exc:
         print(f"  实际抛出 {type(exc).__name__}: {exc}")
         print("  放大 probe_budget 后重算同一输入即可得到完整划分（预算耗尽≠无解）。")
+
+    print("=" * 72)
+    print("带显式参考起点的读段模式（变长读段，按参考坐标汇聚，无插缺比对）")
+    print("=" * 72)
+    # 确定性构造：大根 AAAA 的长读段 + 两端搭接短读段 + 中间空洞；
+    # 错误 UMI AAAT 被吸收，其读段来自相邻参考区间。
+    positioned = [
+        PositionedRead("AAAA", 0, "AACCGG", (30, 30, 30, 30, 30, 30)),
+        PositionedRead("AAAA", 0, "AAC", (25, 25, 25)),
+        PositionedRead("AAAA", 8, "TTAA", (30, 30, 30, 30)),
+        PositionedRead("AAAT", 10, "AG", (20, 20)),
+    ]
+    t1 = time.perf_counter()
+    pres = analyze_positioned_reads(positioned)
+    elapsed1 = time.perf_counter() - t1
+    print(f"读段总数: {len(positioned)}（变长，带参考起点）")
+    print(
+        f"[正常结果] 合并前分子数 = {pres.nodes_before}，"
+        f"合并后分子数 = {pres.molecules_after}"
+        f"（真实计算耗时 {elapsed1*1000:.2f} ms）"
+    )
+    for mol in pres.molecules:
+        print(f"  根={mol.root_umi} 成员={list(mol.members)} "
+              f"参考区间=[{mol.ref_start}, {mol.ref_start + len(mol.consensus_seq)})")
+        print(f"  共识={mol.consensus_seq}")
+        print(f"  覆盖数={list(mol.coverage)}")
+        gaps = ", ".join("缺失" if g is None else f"{g:.4f}" for g in mol.confidence_gap)
+        print(f"  信心差=[{gaps}]")
+    print("  说明: 坐标 6..7 无读段覆盖（空洞），共识 N 且信心差缺失；")
+    print("        空洞不是低质量观测；短读段只在自身坐标投票，不错位。")
+
+    print("[拒绝边界 3] 负参考起点：必须拒绝")
+    try:
+        PositionedRead("AA", -1, "AC", (20, 20))
+    except InvalidArgumentError as exc:
+        print(f"  实际抛出 {type(exc).__name__}: {exc}")
 
     print("\n演示完成。")
 

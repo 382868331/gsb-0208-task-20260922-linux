@@ -31,6 +31,14 @@ from .core import (
     cluster_umis,
     consensus,
 )
+from .positioned import (
+    MAX_REF_START,
+    PositionedAnalysisResult,
+    PositionedMolecule,
+    PositionedRead,
+    analyze_positioned_reads,
+    positioned_consensus,
+)
 from .errors import (
     InvalidArgumentError,
     InvalidReadError,
@@ -52,6 +60,12 @@ __all__ = [
     "Molecule",
     "AnalysisResult",
     "analyze_reads",
+    "MAX_REF_START",
+    "PositionedRead",
+    "PositionedMolecule",
+    "PositionedAnalysisResult",
+    "positioned_consensus",
+    "analyze_positioned_reads",
     "cluster_umis",
     "consensus",
     "UMICorrectError",

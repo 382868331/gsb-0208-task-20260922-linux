@@ -10,12 +10,16 @@
 ## 准确命令
 
 ```bash
-# 必要测试（42 个用例：手算似然、穷举小有向图参考、丰度桥、相等根、低质量多数、空读段拒绝等）
-python -m unittest discover -s tests -v
+# 必要测试（58 个用例：手算似然、穷举小有向图参考、丰度桥、相等根、低质量多数、
+# 空读段拒绝、参考起点模式的两端重叠/中间空洞/负起点/同UMI不同起点/无重叠等）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.03 秒，远小于 8 秒；真实计算，无 sleep、无预录结果）
-python demo.py
+# 固定输入演示（约 0.04 秒，远小于 90 秒；真实计算，无 sleep、无预录结果）
+./.venv/bin/python demo.py
 ```
+
+（系统已安装 Python 3.14.7 时，`python -m unittest discover -s tests -v`
+与 `python demo.py` 等价；上文使用仓库内隔离环境解释器。）
 
 ## 公开接口
 
@@ -45,6 +49,41 @@ for mol in result.molecules:
 | `analyze_reads(reads, *, probe_budget=...)` | `list[Read]` | `AnalysisResult` | 校验→计数→吸收→共识 |
 
 `Cluster` 字段：`root`、`members`、`root_count`、`total_count`。
+
+### 带显式参考起点的读段模式（变长读段）
+
+```python
+from umicorrect import PositionedRead, analyze_positioned_reads, positioned_consensus
+
+read = PositionedRead(umi="AAA", start=100, sequence="ACGT", qualities=(30, 25, 20, 15))
+result = analyze_positioned_reads([read, ...], probe_budget=200_000_000)
+
+for mol in result.molecules:
+    mol.root_umi         # 簇根 UMI（吸收规则与等长模式完全一致）
+    mol.members          # 成员 UMI 元组
+    mol.read_indices     # 成员读段在输入批次中的下标（升序）
+    mol.ref_start        # 簇输出区间起点 = 成员最小覆盖参考坐标
+    mol.consensus_seq    # [ref_start, ref_start+len) 的共识；空洞与并列均为 'N'
+    mol.confidence_gap   # 逐位置 (最高ll-次高ll)；并列 0.0；空洞为 None（缺失）
+    mol.coverage         # 逐位置覆盖读段数；空洞为 0
+```
+
+- `PositionedRead.umi`：批次内定长的 A/C/G/T 串（规则同 `Read`）。
+- `PositionedRead.start`：0 基参考起点，非负整数；拒绝 bool、浮点
+  （NaN/Infinity 专门报错）、负数（`InvalidArgumentError`），超过
+  `MAX_REF_START = 10_000_000` 报 `LimitExceededError`。
+- `sequence` / `qualities` 等长，规则同 `Read`；**读段长度可以不同**，
+  也不要求与 UMI 等长。
+- 同簇读段仍来自同一参考区间：簇输出区间为成员覆盖坐标的最小到最大值；
+  按参考坐标逐位置汇聚，**不做插缺比对**，短读段只在自己覆盖的坐标投票，
+  不会把长读段位置顶错位。
+- 未覆盖位置（空洞）没有投票：共识输出 `'N'`、信心差为 `None`、覆盖数 0；
+  空洞**不是**一条低质量观测（与 Q=0 观测严格区分，Q=0 时 gap=0.0 而非 None）。
+- Q=0 与并列规则沿用等长模式的原对数似然契约。
+- 兼容性：全部读段 `start=0` 且等长时，共识与信心差和 `analyze_reads`
+  完全一致（有测试锁定）。
+- `positioned_consensus(reads, read_indices)` 返回
+  `(ref_start, 共识序列, 逐位置信心差, 逐位置覆盖数)`。
 
 ## 算法与契约
 
@@ -159,8 +198,9 @@ O(K²)。
 
 ## 已知限制
 
-- 仅支持固定长度 UMI 与等长读段；不支持变长 UMI、插入/缺失（indel）
-  造成的长度变化。
+- UMI 仍需批次内定长；等长模式（`analyze_reads`）要求读段等长，变长
+  读段请用定位模式（`analyze_positioned_reads`）。定位模式按显式参考
+  起点汇聚，不做插缺比对（indel 不会自动对齐），也不建模双端链身份。
 - 错误模型为“每位置独立、错误均匀分给其余 3 种碱基”；不建模上下文
   相关错误率、链特异性、双重 UMI 或 UMI 接头结构。
 - 共识序列不输出 IUPAC 模糊码，证据并列一律 N；Q=0 呼中碱基似然为 -∞。
@@ -172,7 +212,7 @@ O(K²)。
 ## 仓库结构
 
 ```
-umicorrect/          本题库（errors.py 异常；core.py 核心算法）
+umicorrect/          本题库（errors.py 异常；core.py 等长核心；positioned.py 参考起点模式）
 tests/               unittest 用例 + 独立参考 reference.py
 demo.py              固定输入演示
 requirements.txt     无第三方依赖（仅注释说明）
