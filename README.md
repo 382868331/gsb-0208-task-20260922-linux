@@ -10,11 +10,12 @@
 ## 准确命令
 
 ```bash
-# 必要测试（42 个用例：手算似然、穷举小有向图参考、丰度桥、相等根、低质量多数、空读段拒绝等）
-python -m unittest discover -s tests -v
+# 必要测试（61 个用例：手算似然、穷举小有向图参考、丰度桥、相等根、低质量多数、
+# 空读段拒绝、锚定模式的两端重叠/中间空洞/负起点/同UMI不同起点/无重叠/顺序打乱等）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.03 秒，远小于 8 秒；真实计算，无 sleep、无预录结果）
-python demo.py
+# 固定输入演示（约 0.04 秒，远小于 90 秒；真实计算，无 sleep、无预录结果）
+./.venv/bin/python demo.py
 ```
 
 ## 公开接口
@@ -45,6 +46,48 @@ for mol in result.molecules:
 | `analyze_reads(reads, *, probe_budget=...)` | `list[Read]` | `AnalysisResult` | 校验→计数→吸收→共识 |
 
 `Cluster` 字段：`root`、`members`、`root_count`、`total_count`。
+
+## 锚定（显式参考起点）读段模式
+
+在等长模式之外，本库提供**带显式参考起点**的可变长读段模式：每条读段
+自带参考坐标起点，同簇读段按参考坐标对齐汇聚，**不做插缺比对**（坐标
+是唯一对齐依据，多条短读段不会把长读段的碱基挤错位）。
+
+```python
+from umicorrect import AnchoredRead, analyze_anchored_reads, anchored_consensus
+
+reads = [
+    AnchoredRead(umi="AAAA", start=0,  sequence="ACGTAC", qualities=(30,)*6),
+    AnchoredRead(umi="AAAA", start=4,  sequence="ACTG",   qualities=(28,)*4),
+    AnchoredRead(umi="AAAA", start=10, sequence="GG",     qualities=(30,)*2),
+]
+result = analyze_anchored_reads(reads, probe_budget=200_000_000)
+for mol in result.molecules:
+    mol.ref_start, mol.ref_end   # 簇覆盖的参考区间 [ref_start, ref_end)
+    mol.consensus_seq            # 逐参考坐标共识；并列/空洞位置为 'N'
+    mol.confidence_gap           # 逐坐标信心差；空洞位置为 None（缺失）
+    mol.coverage                 # 逐坐标覆盖读段条数；0 表示空洞
+```
+
+锚定模式契约：
+
+- `AnchoredRead(umi, start, sequence, qualities)`：`start` 为非负整数
+  参考坐标（**负起点构造期即拒绝**；bool/float 同样拒绝）；`sequence`
+  第 j 个碱基落在参考坐标 `start + j`。同批读段长度可不同，UMI 长度
+  仍须全批一致；**不要求** sequence 与 UMI 等长。
+- UMI 吸收规则与等长模式**完全一致**（同一 `cluster_umis` 实现）：
+  同 UMI 不同起点的读段仍属同一节点/同一簇。
+- 簇共识跨度为**最小到最大覆盖坐标**；被至少一条读段覆盖的坐标按与
+  等长模式相同的对数似然规则投票（Q=0 呼中 ll 为 -inf、精确并列输出
+  N 且 gap=0.0）。**未覆盖坐标（空洞）没有投票**：输出 'N'、
+  `confidence_gap` 为 `None`（缺失）、`coverage` 为 0——空洞不是
+  一条低质量观测，不参与任何似然累计。
+- `anchored_consensus(reads, *, read_indices)` 为分层接口，返回
+  `(ref_start, ref_end, consensus_seq, confidence_gap, coverage)`。
+- 输入顺序打乱不改变根分组与共识序列（求和按读段下标有序进行，浮点
+  gap 仅可能有 ulp 级差异，同 1e-12 容差口径）。
+- 全部 `start` 为 0 且读段等长时，锚定共识与等长入口结果一致
+  （回归测试覆盖）。
 
 ## 算法与契约
 
@@ -159,8 +202,8 @@ O(K²)。
 
 ## 已知限制
 
-- 仅支持固定长度 UMI 与等长读段；不支持变长 UMI、插入/缺失（indel）
-  造成的长度变化。
+- UMI 仍为全批固定长度；读段在等长模式下须与 UMI 等长，锚定模式下可
+  变长但**不做插缺（indel）比对**，对齐完全依赖显式参考起点。
 - 错误模型为“每位置独立、错误均匀分给其余 3 种碱基”；不建模上下文
   相关错误率、链特异性、双重 UMI 或 UMI 接头结构。
 - 共识序列不输出 IUPAC 模糊码，证据并列一律 N；Q=0 呼中碱基似然为 -∞。

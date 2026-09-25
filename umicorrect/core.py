@@ -56,9 +56,12 @@ from .errors import (
 
 __all__ = [
     "Read",
+    "AnchoredRead",
     "Molecule",
+    "AnchoredMolecule",
     "Cluster",
     "AnalysisResult",
+    "AnchoredAnalysisResult",
     "DEFAULT_PROBE_BUDGET",
     "MAX_UMI_LENGTH",
     "MAX_READ_LENGTH",
@@ -68,7 +71,9 @@ __all__ = [
     "BASES",
     "cluster_umis",
     "consensus",
+    "anchored_consensus",
     "analyze_reads",
+    "analyze_anchored_reads",
 ]
 
 BASES = ("A", "C", "G", "T")
@@ -559,6 +564,297 @@ def analyze_reads(
         molecules=tuple(molecules),
         umi_length=umi_len,
         read_length=read_len,
+        nodes_before=nodes_before,
+        molecules_after=len(molecules),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 锚定（显式参考起点）读段模式
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class AnchoredRead:
+    """一条带显式参考起点的读段（可变长，不做插缺比对）。
+
+    start 为该读段第 0 个碱基在共享参考上的整数坐标（>= 0）；sequence 第
+    j 个碱基落在参考坐标 start + j。同一批次内各读段长度可以不同；同簇
+    读段按参考坐标对齐汇聚，坐标是唯一对齐依据（多条短读段不会把长读段
+    的碱基挤错位）。UMI 与序列仅允许 A/C/G/T；qualities 为逐碱基 Phred
+    质量分（整数 0..40），长度与序列一致。
+
+    构造时即做完整字段校验（含负起点拒绝）。
+    """
+
+    umi: str
+    start: int
+    sequence: str
+    qualities: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.qualities, list):
+            object.__setattr__(self, "qualities", tuple(self.qualities))
+        _check_anchored_read_fields(self)
+
+
+@dataclass(frozen=True)
+class AnchoredMolecule:
+    """一个参考坐标共识分子（锚定模式）。
+
+    Attributes:
+        root_umi:      簇根 UMI（首个最高节点）。
+        members:       成员 UMI 元组（含根，字典序升序）。
+        read_indices:  成员读段在输入批次中的下标（升序）。
+        ref_start:     簇内最小覆盖参考坐标（含）。
+        ref_end:       簇内最大覆盖参考坐标 + 1（不含）；共识跨度为
+                       [ref_start, ref_end)。
+        consensus_seq: 逐参考坐标共识；并列或无覆盖（空洞）位置为 'N'。
+        confidence_gap: 逐位置 (最高 ll - 次高 ll)；并列位置 0.0；
+                       无覆盖位置为 None（缺失，不是 0.0）。
+        coverage:      逐位置覆盖该坐标的读段条数（0 表示空洞）。
+    """
+
+    root_umi: str
+    members: tuple[str, ...]
+    read_indices: tuple[int, ...]
+    ref_start: int
+    ref_end: int
+    consensus_seq: str
+    confidence_gap: tuple[float | None, ...]
+    coverage: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class AnchoredAnalysisResult:
+    """锚定批次分析结果。molecules 按 (读段数降序, 根 UMI 字典序) 排列。"""
+
+    molecules: tuple[AnchoredMolecule, ...]
+    umi_length: int
+    nodes_before: int
+    molecules_after: int
+
+    @property
+    def merged_count(self) -> int:
+        """吸收操作合并掉的 UMI 种数。"""
+        return self.nodes_before - self.molecules_after
+
+
+def _check_anchored_read_fields(read: AnchoredRead) -> None:
+    """单条锚定读段的字段级校验（构造与批次校验共用）。
+
+    与等长模式共用字母表/质量规则，但：start 必须为非负整数（拒绝 bool
+    与负起点），sequence 与 qualities 等长即可，不要求与 UMI 等长。
+    """
+    umi = read.umi
+    seq = read.sequence
+    qual = read.qualities
+
+    if not isinstance(umi, str):
+        raise InvalidArgumentError(f"umi 必须是 str，得到 {type(umi).__name__}")
+    if not isinstance(seq, str):
+        raise InvalidArgumentError(f"sequence 必须是 str，得到 {type(seq).__name__}")
+    if not isinstance(qual, tuple):
+        raise InvalidArgumentError(
+            f"qualities 必须是 tuple（或 list），得到 {type(qual).__name__}"
+        )
+
+    if not umi:
+        raise InvalidArgumentError(f"umi 为空串：UMI 长度必须 >= {MIN_UMI_LENGTH}")
+    if not seq:
+        raise InvalidArgumentError(f"sequence 为空串：读段长度必须 >= {MIN_READ_LENGTH}")
+    if len(umi) > MAX_UMI_LENGTH:
+        raise LimitExceededError(f"umi 长度 {len(umi)} 超过上限 {MAX_UMI_LENGTH}")
+    if len(seq) > MAX_READ_LENGTH:
+        raise LimitExceededError(f"sequence 长度 {len(seq)} 超过上限 {MAX_READ_LENGTH}")
+    if len(qual) != len(seq):
+        raise InvalidArgumentError(
+            f"qualities 长度 {len(qual)} 与序列长度 {len(seq)} 不一致"
+        )
+
+    if isinstance(read.start, bool) or not isinstance(read.start, int):
+        raise InvalidArgumentError(
+            f"start 必须是整数且不能是 bool，得到 {read.start!r}"
+        )
+    if read.start < 0:
+        raise InvalidArgumentError(
+            f"start = {read.start} 为负参考起点：参考坐标必须 >= 0（负起点被拒绝）"
+        )
+
+    for j, ch in enumerate(umi):
+        if ch not in _BASE_INDEX:
+            raise InvalidArgumentError(f"umi[{j}] = {ch!r} 非法，仅允许 A/C/G/T（拒绝 N/小写）")
+    for j, ch in enumerate(seq):
+        if ch not in _BASE_INDEX:
+            raise InvalidArgumentError(
+                f"sequence[{j}] = {ch!r} 非法，仅允许 A/C/G/T（拒绝 N/小写）"
+            )
+    for j, q in enumerate(qual):
+        if isinstance(q, bool) or not isinstance(q, int):
+            if isinstance(q, float) and not isinstance(q, bool):
+                _reject_nonfinite(f"qualities[{j}]", q)
+            raise InvalidArgumentError(
+                f"qualities[{j}] 必须是 0..40 的整数且不能是 bool，得到 {type(q).__name__}"
+            )
+        if q < 0 or q > 40:
+            raise InvalidArgumentError(f"qualities[{j}] = {q} 越界，允许范围 0..40")
+
+
+def _validate_anchored_batch(reads) -> int:
+    """校验整个锚定批次（先全部校验、后构建）。返回固定 UMI 长度。"""
+    if not isinstance(reads, (list, tuple)):
+        raise InvalidArgumentError(
+            f"reads 必须是 list/tuple，得到 {type(reads).__name__}"
+        )
+    if len(reads) > MAX_READS:
+        raise LimitExceededError(f"读段数 {len(reads)} 超过上限 {MAX_READS}")
+    if len(reads) == 0:
+        raise InvalidArgumentError(
+            "reads 为空批次：无法确定固定 UMI 长度（空批次被拒绝）"
+        )
+
+    fixed_umi_len: int | None = None
+    for i, read in enumerate(reads):
+        if not isinstance(read, AnchoredRead):
+            raise InvalidReadError(
+                f"reads[{i}] 必须是 AnchoredRead，得到 {type(read).__name__}"
+            )
+        try:
+            _check_anchored_read_fields(read)
+        except InvalidArgumentError as exc:
+            raise InvalidReadError(f"reads[{i}]: {exc}") from exc
+        if fixed_umi_len is None:
+            fixed_umi_len = len(read.umi)
+        elif len(read.umi) != fixed_umi_len:
+            raise InvalidReadError(
+                f"reads[{i}].umi 长度 {len(read.umi)} 与批次固定 UMI 长度 "
+                f"{fixed_umi_len} 不一致"
+            )
+    assert fixed_umi_len is not None
+    return fixed_umi_len
+
+
+def anchored_consensus(
+    reads,
+    *,
+    read_indices: tuple[int, ...],
+) -> tuple[int, int, str, tuple[float | None, ...], tuple[int, ...]]:
+    """对一簇锚定读段按参考坐标计算对数似然共识。
+
+    每个被至少一条读段覆盖的参考坐标独立累计 A/C/G/T 对数似然（规则与
+    等长模式完全一致：呼中 1-e，其余各 e/3，Q=0 时呼中 ll 为 -inf，精确
+    并列输出 'N' 且 gap=0.0）。未被任何读段覆盖的坐标（空洞）没有投票：
+    输出 'N'、confidence_gap 为 None（缺失），coverage 为 0；空洞不是一
+    条低质量观测，不参与任何似然累计。
+
+    Args:
+        reads: 锚定批次读段序列（AnchoredRead）。
+        read_indices: 参与本簇共识的读段下标；非空。
+
+    Returns:
+        (ref_start, ref_end, consensus_seq, confidence_gap, coverage)，
+        跨度为 [ref_start, ref_end)。
+    """
+    if read_indices is None or len(read_indices) == 0:
+        raise InvalidArgumentError("共识簇至少需要 1 条读段（空簇被拒绝）")
+
+    ordered_indices = sorted(read_indices)
+    spans: list[tuple[int, int]] = []
+    for i in ordered_indices:
+        if isinstance(i, bool) or not isinstance(i, int):
+            raise InvalidArgumentError("read_indices 必须全为 int 且不能是 bool")
+        if i < 0 or i >= len(reads):
+            raise InvalidArgumentError(f"read_indices 含越界下标 {i}（批次共 {len(reads)} 条）")
+        read = reads[i]
+        spans.append((read.start, read.start + len(read.sequence)))
+
+    ref_start = min(s for s, _ in spans)
+    ref_end = max(e for _, e in spans)
+    width = ref_end - ref_start
+
+    ll = [[0.0, 0.0, 0.0, 0.0] for _ in range(width)]
+    coverage = [0] * width
+
+    # 有序累加（按下标升序），求和顺序确定、与输入排列无关
+    for i in ordered_indices:
+        read = reads[i]
+        offset = read.start - ref_start
+        for j, ch in enumerate(read.sequence):
+            pos = offset + j
+            b = _BASE_INDEX[ch]
+            log_correct, log_wrong = _LL_TABLE[read.qualities[j]]
+            row = ll[pos]
+            for k in range(4):
+                row[k] += log_correct if k == b else log_wrong
+            coverage[pos] += 1
+
+    out_bases: list[str] = []
+    gaps: list[float | None] = []
+    for pos in range(width):
+        if coverage[pos] == 0:
+            # 空洞：无投票，不是低质量观测
+            out_bases.append("N")
+            gaps.append(None)
+            continue
+        row = ll[pos]
+        best = max(range(4), key=lambda k: row[k])
+        best_val = row[best]
+        tied = [k for k in range(4) if k != best and row[k] == best_val]
+        if tied:
+            out_bases.append("N")
+            gaps.append(0.0)
+        else:
+            second = max(row[k] for k in range(4) if k != best)
+            out_bases.append(BASES[best])
+            gaps.append(best_val - second)
+    return ref_start, ref_end, "".join(out_bases), tuple(gaps), tuple(coverage)
+
+
+def analyze_anchored_reads(
+    reads,
+    *,
+    probe_budget: int = DEFAULT_PROBE_BUDGET,
+) -> AnchoredAnalysisResult:
+    """锚定模式顶层管线：校验 → UMI 计数 → 吸收聚类 → 逐簇按参考坐标共识。
+
+    UMI 吸收规则与等长模式完全一致（cluster_umis 原样复用）；簇内读段
+    长度可不同、起点可不同，按显式参考坐标对齐汇聚，不做插缺比对。
+    校验先于任何状态构建；任一读段非法或预算耗尽都直接抛错，不产生
+    部分结果。
+    """
+    # 1) 整批先校验（原子失败语义）
+    umi_len = _validate_anchored_batch(reads)
+
+    # 2) 分组计数
+    groups = _group_by_umi(reads)
+    umi_counts = {u: len(v) for u, v in groups.items()}
+
+    # 3) 吸收聚类（与等长模式同一实现）
+    clusters = cluster_umis(umi_counts, probe_budget=probe_budget)
+    nodes_before = len(umi_counts)
+
+    # 4) 逐簇按参考坐标共识
+    molecules: list[AnchoredMolecule] = []
+    for cl in clusters:
+        idxs = tuple(sorted(i for u in cl.members for i in groups[u]))
+        ref_start, ref_end, seq, gaps, cov = anchored_consensus(
+            reads, read_indices=idxs
+        )
+        molecules.append(
+            AnchoredMolecule(
+                root_umi=cl.root,
+                members=cl.members,
+                read_indices=idxs,
+                ref_start=ref_start,
+                ref_end=ref_end,
+                consensus_seq=seq,
+                confidence_gap=gaps,
+                coverage=cov,
+            )
+        )
+
+    molecules.sort(key=lambda m: (-len(m.read_indices), m.root_umi))
+    return AnchoredAnalysisResult(
+        molecules=tuple(molecules),
+        umi_length=umi_len,
         nodes_before=nodes_before,
         molecules_after=len(molecules),
     )
