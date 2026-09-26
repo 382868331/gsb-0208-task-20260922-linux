@@ -60,15 +60,18 @@ __all__ = [
     "Cluster",
     "AnalysisResult",
     "DEFAULT_PROBE_BUDGET",
+    "DEFAULT_EDIT_ERROR_RATE",
     "MAX_UMI_LENGTH",
     "MAX_READ_LENGTH",
     "MAX_READS",
     "MIN_UMI_LENGTH",
     "MIN_READ_LENGTH",
     "BASES",
+    "ERROR_MODELS",
     "cluster_umis",
     "consensus",
     "analyze_reads",
+    "edit_path_probability",
 ]
 
 BASES = ("A", "C", "G", "T")
@@ -84,6 +87,11 @@ MAX_READS = 1_000_000
 # 默认 2e8 覆盖约 2 万个去重 UMI 的最坏两两比较；典型 UMI 数据邻接稀疏，
 # 实际探测远少于此。更大 K 需显式放大预算，耗尽时报错而非截断结果。
 DEFAULT_PROBE_BUDGET = 200_000_000
+
+# 可选编辑距离模型的缺省每位置错误率（调用方未提供质量画像时使用）。
+DEFAULT_EDIT_ERROR_RATE = 0.01
+# 支持的吸收错误模型："hamming"（默认，原行为）/ "edit"（编辑距离 <=2）。
+ERROR_MODELS = ("hamming", "edit")
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +262,13 @@ def _check_read_fields(read: Read) -> None:
             raise InvalidArgumentError(f"qualities[{j}] = {q} 越界，允许范围 0..40")
 
 
-def _validate_batch(reads) -> tuple[int, int]:
+def _validate_batch(reads, *, allow_variable_umi_length: bool = False) -> tuple[int, int]:
     """校验整个批次（先全部校验、后构建，失败不留部分状态）。
 
     返回 (固定 UMI 长度, 固定读段长度)。所有错误消息带 ``reads[i]`` 前缀。
+    allow_variable_umi_length=True（编辑距离模式）时允许各读段 UMI 长度
+    不同（读段长度仍与各自 UMI 等长，由 Read 字段级校验保证）；此时返回
+    首条读段的长度作为代表值。
     """
     if not isinstance(reads, (list, tuple)):
         raise InvalidArgumentError(
@@ -287,6 +298,8 @@ def _validate_batch(reads) -> tuple[int, int]:
             fixed_umi_len = len(read.umi)
             read_len = len(read.sequence)
         elif len(read.umi) != fixed_umi_len:
+            if allow_variable_umi_length:
+                continue
             raise InvalidReadError(
                 f"reads[{i}].umi 长度 {len(read.umi)} 与批次固定 UMI 长度 "
                 f"{fixed_umi_len} 不一致"
@@ -312,13 +325,26 @@ def cluster_umis(
     umi_counts: dict[str, int],
     *,
     probe_budget: int = DEFAULT_PROBE_BUDGET,
+    error_model: str = "hamming",
+    umi_error_profiles: dict[str, tuple[float, ...]] | None = None,
+    ambiguity_margin: float = 0.0,
 ) -> tuple[Cluster, ...]:
     """按题面规则把 UMI 节点吸收成簇（不做碱基共识）。
 
     Args:
         umi_counts: UMI -> 计数（正整数）。键必须为等长 A/C/G/T 串。
-        probe_budget: Hamming 比较（邻居探测）次数上限；耗尽抛
+            （error_model="edit" 时允许长度相差 1 的 UMI 共存。）
+        probe_budget: 邻居探测（节点对评估）次数上限；耗尽抛
             :class:`SearchBudgetExhaustedError`（结果未知，区别于无解）。
+        error_model: "hamming"（默认，原行为：Hamming 恰为 1 才吸收）或
+            "edit"（编辑距离模型：一次插入/删除 + 替换，总编辑数 <= 2）。
+        umi_error_profiles: 仅 edit 模式使用：UMI -> 逐位置错误率画像
+            （[0,1] 实数，长度与 UMI 相同）。为 None 时全部位置使用
+            :data:`DEFAULT_EDIT_ERROR_RATE`。
+        ambiguity_margin: 仅 edit 模式使用：某节点的最佳候选父节点与次佳
+            候选的路径概率对数差（log10 域）<= 该阈值时，判定为歧义，
+            该节点**保留未归并**（自成一根），避免强行吸收。默认 0.0，
+            即只有精确并列才视为歧义。
 
     Returns:
         Cluster 元组，按 (簇总计数降序, 根 UMI 字典序) 排列。
@@ -326,6 +352,8 @@ def cluster_umis(
     probe_budget = _strict_int("probe_budget", probe_budget)
     if probe_budget < 0:
         raise InvalidArgumentError("probe_budget 必须为非负整数")
+    error_model = _check_error_model(error_model)
+    ambiguity_margin = _check_margin(ambiguity_margin)
     if not isinstance(umi_counts, dict):
         raise InvalidArgumentError(
             f"umi_counts 必须是 dict，得到 {type(umi_counts).__name__}"
@@ -342,7 +370,7 @@ def cluster_umis(
             raise LimitExceededError(f"UMI 长度 {len(umi)} 超过上限 {MAX_UMI_LENGTH}")
         if fixed_len is None:
             fixed_len = len(umi)
-        elif len(umi) != fixed_len:
+        elif len(umi) != fixed_len and error_model == "hamming":
             raise InvalidArgumentError(
                 f"UMI {umi!r} 长度 {len(umi)} 与固定长度 {fixed_len} 不一致"
             )
@@ -359,28 +387,87 @@ def cluster_umis(
     if not umi_counts:
         return ()
 
+    # edit 模式：准备逐位置错误率画像（缺省用统一默认错误率）
+    profiles: dict[str, tuple[float, ...]] = {}
+    if error_model == "edit":
+        if umi_error_profiles is not None and not isinstance(umi_error_profiles, dict):
+            raise InvalidArgumentError(
+                f"umi_error_profiles 必须是 dict 或 None，"
+                f"得到 {type(umi_error_profiles).__name__}"
+            )
+        for umi in umi_counts:
+            if umi_error_profiles is None:
+                profiles[umi] = (DEFAULT_EDIT_ERROR_RATE,) * len(umi)
+            else:
+                if umi not in umi_error_profiles:
+                    raise InvalidArgumentError(
+                        f"umi_error_profiles 缺少 UMI {umi!r} 的画像"
+                    )
+                profiles[umi] = _check_profile(
+                    "umi_error_profiles", umi, umi_error_profiles[umi]
+                )
+
     # count 降序、再 UMI 字典序升序 —— 全局确定全序
     ordered = sorted(umi_counts, key=lambda u: (-umi_counts[u], u))
+    order_index = {u: i for i, u in enumerate(ordered)}
 
     # ---- 构造有向边 u -> v（u 在全序中先于 v）----
     # adjacency[u] 按全序排列，保证 BFS 确定性。
     probes = 0
     adjacency: dict[str, list[str]] = {u: [] for u in ordered}
-    for ai in range(len(ordered)):
-        u = ordered[ai]
-        cu = umi_counts[u]
-        for bi in range(ai + 1, len(ordered)):
-            v = ordered[bi]
-            probes += 1
-            if probes > probe_budget:
-                raise SearchBudgetExhaustedError(
-                    f"Hamming 邻居探测预算耗尽（已用 {probes}，预算 {probe_budget}）；"
-                    "吸收结果未知，请放大 probe_budget 后重算",
-                    probes_used=probes,
-                    budget=probe_budget,
-                )
-            if _hamming1(u, v) and cu >= 2 * umi_counts[v] - 1:
-                adjacency[u].append(v)
+    if error_model == "hamming":
+        for ai in range(len(ordered)):
+            u = ordered[ai]
+            cu = umi_counts[u]
+            for bi in range(ai + 1, len(ordered)):
+                v = ordered[bi]
+                probes += 1
+                if probes > probe_budget:
+                    raise SearchBudgetExhaustedError(
+                        f"Hamming 邻居探测预算耗尽（已用 {probes}，预算 {probe_budget}）；"
+                        "吸收结果未知，请放大 probe_budget 后重算",
+                        probes_used=probes,
+                        budget=probe_budget,
+                    )
+                if _hamming1(u, v) and cu >= 2 * umi_counts[v] - 1:
+                    adjacency[u].append(v)
+    else:
+        # edit 模式：先按丰度方向（全序在前 -> 在后）找候选，再用碱基质量
+        # 画像计算各候选的最短编辑路径概率和，取最佳者建边；最佳与次佳
+        # 差距 <= ambiguity_margin 时判歧义，该节点保留未归并。
+        candidates: dict[str, list[tuple[str, float]]] = {u: [] for u in ordered}
+        for ai in range(len(ordered)):
+            u = ordered[ai]
+            cu = umi_counts[u]
+            for bi in range(ai + 1, len(ordered)):
+                v = ordered[bi]
+                probes += 1
+                if probes > probe_budget:
+                    raise SearchBudgetExhaustedError(
+                        f"编辑距离候选探测预算耗尽（已用 {probes}，预算 {probe_budget}）；"
+                        "吸收结果未知，请放大 probe_budget 后重算",
+                        probes_used=probes,
+                        budget=probe_budget,
+                    )
+                if cu < 2 * umi_counts[v] - 1:
+                    continue
+                stats = _edit_dp_sum(u, v, profiles[v])
+                if stats is None:
+                    continue
+                _edits, prob_sum = stats
+                candidates[v].append((u, math.log10(prob_sum)))
+        for v in ordered:
+            cands = candidates[v]
+            if not cands:
+                continue
+            # 确定排序：得分降序，并列按全序（与候选遍历顺序无关）
+            cands.sort(key=lambda t: (-t[1], order_index[t[0]]))
+            best_u, best_score = cands[0]
+            if len(cands) > 1 and best_score - cands[1][1] <= ambiguity_margin:
+                continue  # 歧义：保留未归并，避免强行吸收
+            adjacency[best_u].append(v)
+        for u in ordered:
+            adjacency[u].sort(key=lambda w: order_index[w])
 
     # ---- 按全序建立根，沿有向边确定性 BFS 传递吸收 ----
     # owner[u]：u 已归属的根；None 表示未归属。
@@ -427,6 +514,207 @@ def _hamming1(a: str, b: str) -> bool:
             if diff > 1:
                 return False
     return diff == 1
+
+
+# ---------------------------------------------------------------------------
+# 可选编辑距离模型：一次插入/删除 + 替换，总编辑数 <= 2
+# ---------------------------------------------------------------------------
+def _check_error_model(error_model: str) -> str:
+    if not isinstance(error_model, str) or error_model not in ERROR_MODELS:
+        raise InvalidArgumentError(
+            f"error_model 必须是 {ERROR_MODELS} 之一，得到 {error_model!r}"
+        )
+    return error_model
+
+
+def _check_margin(ambiguity_margin) -> float:
+    """歧义阈值：非负有限实数（拒绝 bool / NaN / Infinity）。"""
+    margin = _reject_nonfinite("ambiguity_margin", ambiguity_margin)
+    if margin < 0.0:
+        raise InvalidArgumentError(
+            f"ambiguity_margin 必须为非负实数，得到 {ambiguity_margin!r}"
+        )
+    return margin
+
+
+def _check_profile(name: str, umi: str, profile) -> tuple[float, ...]:
+    """校验单个 UMI 的逐位置错误率画像：长度匹配、取值 [0,1] 有限实数。"""
+    if not isinstance(profile, (tuple, list)):
+        raise InvalidArgumentError(
+            f"{name}[{umi!r}] 错误率画像必须是 tuple/list，得到 {type(profile).__name__}"
+        )
+    if len(profile) != len(umi):
+        raise InvalidArgumentError(
+            f"{name}[{umi!r}] 画像长度 {len(profile)} 与 UMI 长度 {len(umi)} 不一致"
+        )
+    out = []
+    for j, e in enumerate(profile):
+        if isinstance(e, bool) or not isinstance(e, (int, float)):
+            raise InvalidArgumentError(
+                f"{name}[{umi!r}][{j}] 必须是实数，得到 {type(e).__name__}"
+            )
+        fe = float(e)
+        if math.isnan(fe) or math.isinf(fe) or fe < 0.0 or fe > 1.0:
+            raise InvalidArgumentError(
+                f"{name}[{umi!r}][{j}] = {e!r} 越界，允许范围 [0, 1] 的有限实数"
+            )
+        out.append(fe)
+    return tuple(out)
+
+
+def edit_path_probability(
+    u: str, v: str, err_profile
+) -> tuple[int, float] | None:
+    """计算 u -> v 的最短编辑路径概率和（编辑距离模型）。
+
+    路径模型（明确、可独立枚举核对）：
+      * 允许的编辑：替换、一次插入、一次删除；总编辑数 <= 2，
+        且插入/删除合计至多 1 次（不允许两次 indel）；
+      * 一条“路径”是一个对齐（编辑列序列）。重复碱基（同聚物）会产生
+        多种等价对齐，每种对齐都是一条独立路径，概率**累加**，不去重、
+        不依赖候选遍历顺序；
+      * 只累计**最短**（编辑数最小）路径的概率和；
+      * 概率因子（err_profile 为被观测串 v 的逐位置错误率 e_j）：
+        替换（观测位置 j）与插入（观测位置 j）各为 e_j / 3；
+        删除（未观测到碱基）为 v 画像均值 e_del = mean(err_profile)。
+
+    Returns:
+        (最小编辑数, 最短路径概率和)；在该模型内不可达（编辑数 > 2
+        或需要两次 indel）时返回 None。
+    """
+    if not isinstance(u, str) or not isinstance(v, str):
+        raise InvalidArgumentError("u/v 必须是 str")
+    for name, s in (("u", u), ("v", v)):
+        if not s:
+            raise InvalidArgumentError(f"{name} 为空串")
+        for j, ch in enumerate(s):
+            if ch not in _BASE_INDEX:
+                raise InvalidArgumentError(f"{name}[{j}] = {ch!r} 非法，仅允许 A/C/G/T")
+    profile = _check_profile("err_profile", v, err_profile)
+    return _edit_dp_sum(u, v, profile)
+
+
+def _edit_dp_sum(u: str, v: str, profile) -> tuple[int, float] | None:
+    """编辑距离 DP：返回 (最小编辑数, 最短路径概率和)，不可达返回 None。
+
+    状态为 (i, j, k)：已对齐 u[:i] 与 v[:j]，k 为已用 indel 次数（0/1）。
+    同一状态只保留最小编辑数；并列最小编辑数的路径概率**求和**——这正是
+    同聚物多等价对齐被正确累计、而不靠遍历顺序的关键。
+    """
+    lu, lv = len(u), len(v)
+    e_del = sum(profile) / len(profile)
+    layers: list[dict] = [dict() for _ in range(lu + lv + 1)]
+    layers[0][(0, 0, 0)] = (0, 1.0)  # (cost, prob_sum)
+
+    for s in range(lu + lv + 1):
+        layer = layers[s]
+        if not layer:
+            continue
+        for (i, j, k), (cost, prob) in layer.items():
+            if i < lu and j < lv:
+                if u[i] == v[j]:
+                    _relax_sum(layers[s + 2], (i + 1, j + 1, k), cost, prob)
+                else:
+                    _relax_sum(layers[s + 2], (i + 1, j + 1, k),
+                               cost + 1, prob * profile[j] / 3.0)
+            if k == 0:
+                if i < lu:
+                    _relax_sum(layers[s + 1], (i + 1, j, 1), cost + 1, prob * e_del)
+                if j < lv:
+                    _relax_sum(layers[s + 1], (i, j + 1, 1),
+                               cost + 1, prob * profile[j] / 3.0)
+
+    best: tuple[int, float] | None = None
+    for k in (0, 1):
+        st = layers[lu + lv].get((lu, lv, k))
+        if st is None:
+            continue
+        if best is None or st[0] < best[0]:
+            best = st
+        elif st[0] == best[0]:
+            best = (best[0], best[1] + st[1])
+    return best
+
+
+def _relax_sum(layer: dict, key, cost: int, prob: float) -> None:
+    if cost > 2:
+        return
+    cur = layer.get(key)
+    if cur is None or cost < cur[0]:
+        layer[key] = (cost, prob)
+    elif cost == cur[0]:
+        layer[key] = (cost, cur[1] + prob)
+
+
+def _best_alignment(u: str, v: str, profile) -> tuple[tuple, ...]:
+    """返回 u -> v 的一条代表对齐（列元组），用于编辑模式下的共识定位。
+
+    列类型：("m", i, j) 匹配 / ("s", i, j) 替换 / ("d", i) 删除 /
+    ("i", j) 插入。在最短编辑路径中取概率最大者；仍并列时按固定的
+    转移顺序（匹配/替换、删除、插入）取先到达者，完全确定。
+    """
+    lu, lv = len(u), len(v)
+    e_del = sum(profile) / len(profile)
+    layers: list[dict] = [dict() for _ in range(lu + lv + 1)]
+    layers[0][(0, 0, 0)] = (0, 1.0, None)  # (cost, prob, backpointer)
+
+    def relax(ns: int, key, cost: int, prob: float, back) -> None:
+        if cost > 2:
+            return
+        cur = layers[ns].get(key)
+        if cur is None or cost < cur[0] or (cost == cur[0] and prob > cur[1]):
+            layers[ns][key] = (cost, prob, back)
+
+    for s in range(lu + lv + 1):
+        for (i, j, k), (cost, prob, _back) in layers[s].items():
+            if i < lu and j < lv:
+                if u[i] == v[j]:
+                    relax(s + 2, (i + 1, j + 1, k), cost, prob, ((i, j, k), "m"))
+                else:
+                    relax(s + 2, (i + 1, j + 1, k), cost + 1,
+                          prob * profile[j] / 3.0, ((i, j, k), "s"))
+            if k == 0:
+                if i < lu:
+                    relax(s + 1, (i + 1, j, 1), cost + 1, prob * e_del,
+                          ((i, j, k), "d"))
+                if j < lv:
+                    relax(s + 1, (i, j + 1, 1), cost + 1,
+                          prob * profile[j] / 3.0, ((i, j, k), "i"))
+
+    finals = [
+        (key, layers[lu + lv][key])
+        for key in ((lu, lv, 0), (lu, lv, 1))
+        if key in layers[lu + lv]
+    ]
+    if not finals:
+        raise InvalidArgumentError(
+            f"{u!r} -> {v!r} 不在编辑距离模型可达范围内，无法对齐"
+        )
+    min_cost = min(st[0] for _key, st in finals)
+    finals = [(key, st) for key, st in finals if st[0] == min_cost]
+    # 概率最大者优先；再并列按 k=0 优先（字典序确定）
+    finals.sort(key=lambda item: (-item[1][1], item[0]))
+    key = finals[0][0]
+
+    cols: list[tuple] = []
+    while True:
+        i, j, _k = key
+        back = layers[i + j][key][2]
+        if back is None:
+            break
+        prev, op = back
+        pi, pj, _ = prev
+        if op == "m":
+            cols.append(("m", pi, pj))
+        elif op == "s":
+            cols.append(("s", pi, pj))
+        elif op == "d":
+            cols.append(("d", pi))
+        else:
+            cols.append(("i", pj))
+        key = prev
+    cols.reverse()
+    return tuple(cols)
 
 
 # ---------------------------------------------------------------------------
@@ -491,10 +779,17 @@ def consensus(
             for k in range(4):
                 row[k] += log_correct if k == b else log_wrong
 
+    return _finalize_ll(ll)
+
+
+def _finalize_ll(ll: list[list[float]]) -> tuple[str, tuple[float, ...]]:
+    """由逐位置 log10 似然表产出 (共识序列, 逐位置信心差)。
+
+    最高 ll 精确并列的位置输出 'N' 且 gap=0.0（精确 == 判定，不用容差）。
+    """
     out_bases: list[str] = []
     gaps: list[float] = []
-    for pos in range(n):
-        row = ll[pos]
+    for row in ll:
         best = max(range(4), key=lambda k: row[k])
         best_val = row[best]
         # 并列检测：是否存在另一个碱基 ll 与最高完全相等
@@ -509,6 +804,31 @@ def consensus(
     return "".join(out_bases), tuple(gaps)
 
 
+def _consensus_edit(reads, read_indices, root_umi: str) -> tuple[str, tuple[float, ...]]:
+    """编辑距离模式下的变长共识：把每条读段对齐到簇根坐标系。
+
+    每条读段用其自身 UMI 质量画像求到 root_umi 的代表对齐
+    （最短编辑路径中概率最大者，确定性）；匹配/替换列把该读段碱基
+    计入根的对应位置，插入列忽略，删除列该读段不贡献。
+    """
+    n = len(root_umi)
+    ll = [[0.0, 0.0, 0.0, 0.0] for _ in range(n)]
+    for i in sorted(read_indices):
+        read = reads[i]
+        profile = tuple(10.0 ** (-q / 10.0) for q in read.qualities)
+        for col in _best_alignment(root_umi, read.umi, profile):
+            if col[0] not in ("m", "s"):
+                continue  # 插入列无根坐标；删除列无读段碱基
+            _op, pi, pj = col
+            b = _BASE_INDEX[read.sequence[pj]]
+            q = read.qualities[pj]
+            log_correct, log_wrong = _LL_TABLE[q]
+            row = ll[pi]
+            for k in range(4):
+                row[k] += log_correct if k == b else log_wrong
+    return _finalize_ll(ll)
+
+
 # ---------------------------------------------------------------------------
 # 顶层管线
 # ---------------------------------------------------------------------------
@@ -516,31 +836,66 @@ def analyze_reads(
     reads,
     *,
     probe_budget: int = DEFAULT_PROBE_BUDGET,
+    error_model: str = "hamming",
+    ambiguity_margin: float = 0.0,
 ) -> AnalysisResult:
     """对整批读段执行 校验 → UMI 计数 → 吸收聚类 → 逐簇共识。
 
     校验先于任何状态构建并在整个批次上进行；任一读段非法则整批拒绝
     （不产生部分结果）。吸收阶段耗尽预算时同样不返回截断结果。
 
+    Args:
+        reads: Read 列表。默认（hamming 模式）要求全批次 UMI 等长；
+            error_model="edit" 时允许 UMI 长度相差 1 的读段共存。
+        probe_budget: 邻居探测预算，见 :func:`cluster_umis`。
+        error_model: "hamming"（默认，原行为）或 "edit"（编辑距离模型）。
+        ambiguity_margin: 仅 edit 模式：最佳/次佳候选路径概率对数差
+            （log10 域）<= 该阈值的节点保留未归并。
+
     Returns:
         :class:`AnalysisResult`。
     """
+    error_model = _check_error_model(error_model)
+    ambiguity_margin = _check_margin(ambiguity_margin)
     # 1) 整批先校验（原子失败语义）
-    umi_len, read_len = _validate_batch(reads)
+    umi_len, read_len = _validate_batch(
+        reads, allow_variable_umi_length=(error_model == "edit")
+    )
 
     # 2) 分组计数
     groups = _group_by_umi(reads)
     umi_counts = {u: len(v) for u, v in groups.items()}
 
     # 3) 吸收聚类
-    clusters = cluster_umis(umi_counts, probe_budget=probe_budget)
+    if error_model == "edit":
+        # 每个 UMI 节点的逐位置错误率画像：组内各读段 10^(-Q/10) 的均值
+        # （按下标升序累加，确定可复现）
+        profiles = {}
+        for umi, idxs in groups.items():
+            acc = [0.0] * len(umi)
+            for i in sorted(idxs):
+                for j, q in enumerate(reads[i].qualities):
+                    acc[j] += 10.0 ** (-q / 10.0)
+            profiles[umi] = tuple(x / len(idxs) for x in acc)
+        clusters = cluster_umis(
+            umi_counts,
+            probe_budget=probe_budget,
+            error_model="edit",
+            umi_error_profiles=profiles,
+            ambiguity_margin=ambiguity_margin,
+        )
+    else:
+        clusters = cluster_umis(umi_counts, probe_budget=probe_budget)
     nodes_before = len(umi_counts)
 
     # 4) 逐簇共识
     molecules: list[Molecule] = []
     for cl in clusters:
         idxs = sorted(i for u in cl.members for i in groups[u])
-        seq, gaps = consensus(reads, read_len, read_indices=tuple(idxs))
+        if error_model == "edit":
+            seq, gaps = _consensus_edit(reads, tuple(idxs), cl.root)
+        else:
+            seq, gaps = consensus(reads, read_len, read_indices=tuple(idxs))
         molecules.append(
             Molecule(
                 root_umi=cl.root,

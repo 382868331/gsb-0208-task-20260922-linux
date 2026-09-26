@@ -86,3 +86,94 @@ def reference_consensus(
             seq.append(BASES[winners[0]])
             gaps.append(ordered_vals[0] - ordered_vals[1])
     return "".join(seq), gaps
+
+
+def reference_edit_path_probability(u, v, err_profile):
+    """编辑路径概率和的独立参考：显式递归枚举全部对齐路径。
+
+    与核心的 DP 聚合写法完全不同：这里逐条枚举路径（对齐），每条路径
+    独立计算 (编辑数, 概率)，最后取最小编辑数并对并列最短路径求和。
+    路径模型（与核心契约一致）：替换/插入因子 e_j/3（j 为 v 的观测位置），
+    删除因子 mean(err_profile)；indel 合计至多 1 次，总编辑数 <= 2。
+    不可达返回 None，否则返回 (最小编辑数, 概率和)。
+    """
+    e_del = sum(err_profile) / len(err_profile)
+    paths = []  # (edits, prob)
+
+    def rec(i, j, indels, edits, prob):
+        if edits > 2:
+            return
+        if i == len(u) and j == len(v):
+            paths.append((edits, prob))
+            return
+        if i < len(u) and j < len(v):
+            if u[i] == v[j]:
+                rec(i + 1, j + 1, indels, edits, prob)
+            else:
+                rec(i + 1, j + 1, indels, edits + 1, prob * err_profile[j] / 3.0)
+        if indels == 0:
+            if i < len(u):
+                rec(i + 1, j, 1, edits + 1, prob * e_del)
+            if j < len(v):
+                rec(i, j + 1, 1, edits + 1, prob * err_profile[j] / 3.0)
+
+    rec(0, 0, 0, 0, 1.0)
+    if not paths:
+        return None
+    best = min(e for e, _p in paths)
+    return best, sum(p for e, p in paths if e == best)
+
+
+def reference_clusters_edit(umi_counts, err_profiles, ambiguity_margin=0.0):
+    """编辑距离聚类的独立参考：全对枚举候选 + Floyd-Warshall 归属。
+
+    每个节点 v 的候选父节点为全序中在前、count 满足 2s-1 规则且编辑
+    距离 <=2 的 u；得分 = log10(最短路径概率和)。最佳与次佳得分差
+    <= ambiguity_margin 时 v 无父节点（歧义，保留未归并）。
+    返回成员 UMI 列表的列表（根出现序，簇内字典序）。
+    """
+    ordered = sorted(umi_counts, key=lambda u: (-umi_counts[u], u))
+    n = len(ordered)
+    parent = [None] * n
+    for j in range(n):
+        cands = []
+        for i in range(j):
+            if umi_counts[ordered[i]] < 2 * umi_counts[ordered[j]] - 1:
+                continue
+            stats = reference_edit_path_probability(
+                ordered[i], ordered[j], err_profiles[ordered[j]]
+            )
+            if stats is None:
+                continue
+            cands.append((i, math.log10(stats[1])))
+        if not cands:
+            continue
+        cands.sort(key=lambda t: (-t[1], t[0]))
+        if len(cands) > 1 and cands[0][1] - cands[1][1] <= ambiguity_margin:
+            continue  # 歧义：保留未归并
+        parent[j] = cands[0][0]
+
+    reach = [[False] * n for _ in range(n)]
+    for i in range(n):
+        reach[i][i] = True
+    for j in range(n):
+        if parent[j] is not None:
+            reach[parent[j]][j] = True
+    for k in range(n):
+        for i in range(n):
+            if not reach[i][k]:
+                continue
+            for j in range(n):
+                if reach[k][j]:
+                    reach[i][j] = True
+
+    owner = [-1] * n
+    groups = []
+    for i in range(n):
+        if owner[i] != -1:
+            continue
+        taken = [j for j in range(n) if reach[i][j] and owner[j] == -1]
+        for j in taken:
+            owner[j] = i
+        groups.append(sorted(ordered[j] for j in taken))
+    return groups

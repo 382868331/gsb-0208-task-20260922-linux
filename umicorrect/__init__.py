@@ -18,6 +18,8 @@ from __future__ import annotations
 from .core import (
     BASES,
     DEFAULT_PROBE_BUDGET,
+    DEFAULT_EDIT_ERROR_RATE,
+    ERROR_MODELS,
     MAX_READS,
     MAX_READ_LENGTH,
     MAX_UMI_LENGTH,
@@ -30,6 +32,7 @@ from .core import (
     analyze_reads,
     cluster_umis,
     consensus,
+    edit_path_probability,
 )
 from .errors import (
     InvalidArgumentError,
@@ -42,6 +45,8 @@ from .errors import (
 __all__ = [
     "BASES",
     "DEFAULT_PROBE_BUDGET",
+    "DEFAULT_EDIT_ERROR_RATE",
+    "ERROR_MODELS",
     "MAX_READS",
     "MAX_READ_LENGTH",
     "MAX_UMI_LENGTH",
@@ -54,6 +59,7 @@ __all__ = [
     "analyze_reads",
     "cluster_umis",
     "consensus",
+    "edit_path_probability",
     "UMICorrectError",
     "InvalidArgumentError",
     "InvalidReadError",
