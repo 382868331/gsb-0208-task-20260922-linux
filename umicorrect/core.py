@@ -59,6 +59,10 @@ __all__ = [
     "Molecule",
     "Cluster",
     "AnalysisResult",
+    "EditDistanceOptions",
+    "EditCandidate",
+    "EditAssignment",
+    "EditClusteringResult",
     "DEFAULT_PROBE_BUDGET",
     "MAX_UMI_LENGTH",
     "MAX_READ_LENGTH",
@@ -105,10 +109,13 @@ class Read:
     umi: str
     sequence: str
     qualities: tuple[int, ...]
+    umi_qualities: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.qualities, list):
             object.__setattr__(self, "qualities", tuple(self.qualities))
+        if isinstance(self.umi_qualities, list):
+            object.__setattr__(self, "umi_qualities", tuple(self.umi_qualities))
         _check_read_fields(self)
 
 
@@ -157,11 +164,61 @@ class AnalysisResult:
     read_length: int
     nodes_before: int
     molecules_after: int
+    edit_assignments: tuple["EditAssignment", ...] = ()
 
     @property
     def merged_count(self) -> int:
         """吸收操作合并掉的 UMI 种数（= 合并前分子数 - 合并后分子数）。"""
         return self.nodes_before - self.molecules_after
+
+
+@dataclass(frozen=True)
+class EditDistanceOptions:
+    """可选短 UMI 编辑距离吸收模型的参数。
+
+    模型只处理最小编辑距离不超过 ``max_edit_distance`` 的候选，且候选仍须
+    沿丰度全序从高丰度指向低丰度并满足原有 ``2*child_count-1`` 丰度规则。
+
+    Attributes:
+        max_edit_distance: 最多编辑数；当前契约支持 1 或 2。长度差大于 1
+            时不可能在两次编辑内完成，直接不是候选。
+        min_log10_gap: 最佳与次佳候选的 log10 概率差阈值；严格小于该值
+            时低丰度 UMI 保持独立。
+        default_quality: 某条读段未提供 ``umi_qualities`` 时使用的 UMI Q。
+    """
+
+    max_edit_distance: int = 2
+    min_log10_gap: float = 1.0
+    default_quality: int = 20
+
+
+@dataclass(frozen=True)
+class EditCandidate:
+    """一个高丰度根对低丰度观测 UMI 的编辑路径证据。"""
+
+    root: str
+    edit_distance: int
+    log10_probability: float
+    path_count: int
+
+
+@dataclass(frozen=True)
+class EditAssignment:
+    """低丰度 UMI 相对于全部可行高丰度候选的归并/保留决定。"""
+
+    umi: str
+    state: str  # "merged"、"ambiguous" 或 "independent"
+    assigned_root: str | None
+    candidates: tuple[EditCandidate, ...]
+    best_gap: float | None
+
+
+@dataclass(frozen=True)
+class EditClusteringResult:
+    """编辑距离模型的聚类结果和逐低丰度节点证据。"""
+
+    clusters: tuple[Cluster, ...]
+    assignments: tuple[EditAssignment, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +264,7 @@ def _check_read_fields(read: Read) -> None:
     umi = read.umi
     seq = read.sequence
     qual = read.qualities
+    umi_qual = read.umi_qualities
 
     if not isinstance(umi, str):
         raise InvalidArgumentError(f"umi 必须是 str，得到 {type(umi).__name__}")
@@ -215,6 +273,11 @@ def _check_read_fields(read: Read) -> None:
     if not isinstance(qual, tuple):
         raise InvalidArgumentError(
             f"qualities 必须是 tuple（或 list），得到 {type(qual).__name__}"
+        )
+    if umi_qual is not None and not isinstance(umi_qual, tuple):
+        raise InvalidArgumentError(
+            "umi_qualities 必须是 tuple（或 list）或 None，"
+            f"得到 {type(umi_qual).__name__}"
         )
 
     if not umi:
@@ -225,9 +288,10 @@ def _check_read_fields(read: Read) -> None:
         raise LimitExceededError(f"umi 长度 {len(umi)} 超过上限 {MAX_UMI_LENGTH}")
     if len(seq) > MAX_READ_LENGTH:
         raise LimitExceededError(f"sequence 长度 {len(seq)} 超过上限 {MAX_READ_LENGTH}")
-    if len(seq) != len(umi):
+    if umi_qual is None and len(seq) != len(umi):
         raise InvalidArgumentError(
-            f"读段长度 {len(seq)} 与 UMI 长度 {len(umi)} 不相等（契约要求等长）"
+            f"读段长度 {len(seq)} 与 UMI 长度 {len(umi)} 不相等；"
+            "变长 UMI 需同时提供等长 umi_qualities"
         )
     if len(qual) != len(seq):
         raise InvalidArgumentError(
@@ -252,9 +316,24 @@ def _check_read_fields(read: Read) -> None:
             )
         if q < 0 or q > 40:
             raise InvalidArgumentError(f"qualities[{j}] = {q} 越界，允许范围 0..40")
+    if umi_qual is not None:
+        if len(umi_qual) != len(umi):
+            raise InvalidArgumentError(
+                f"umi_qualities 长度 {len(umi_qual)} 与 UMI 长度 {len(umi)} 不一致"
+            )
+        for j, q in enumerate(umi_qual):
+            if isinstance(q, bool) or not isinstance(q, int):
+                raise InvalidArgumentError(
+                    f"umi_qualities[{j}] 必须是 0..40 的整数且不能是 bool，"
+                    f"得到 {type(q).__name__}"
+                )
+            if q < 0 or q > 40:
+                raise InvalidArgumentError(
+                    f"umi_qualities[{j}] = {q} 越界，允许范围 0..40"
+                )
 
 
-def _validate_batch(reads) -> tuple[int, int]:
+def _validate_batch(reads, *, variable_umi: bool = False) -> tuple[int, int]:
     """校验整个批次（先全部校验、后构建，失败不留部分状态）。
 
     返回 (固定 UMI 长度, 固定读段长度)。所有错误消息带 ``reads[i]`` 前缀。
@@ -272,6 +351,8 @@ def _validate_batch(reads) -> tuple[int, int]:
         )
 
     fixed_umi_len: int | None = None
+    min_umi_len: int | None = None
+    max_umi_len = 0
     read_len = 0
     for i, read in enumerate(reads):
         if not isinstance(read, Read):
@@ -285,12 +366,33 @@ def _validate_batch(reads) -> tuple[int, int]:
             raise InvalidReadError(f"reads[{i}]: {exc}") from exc
         if fixed_umi_len is None:
             fixed_umi_len = len(read.umi)
+            min_umi_len = len(read.umi)
+            max_umi_len = len(read.umi)
             read_len = len(read.sequence)
-        elif len(read.umi) != fixed_umi_len:
+        elif not variable_umi and len(read.umi) != fixed_umi_len:
             raise InvalidReadError(
                 f"reads[{i}].umi 长度 {len(read.umi)} 与批次固定 UMI 长度 "
                 f"{fixed_umi_len} 不一致"
             )
+        elif variable_umi:
+            assert min_umi_len is not None
+            min_umi_len = min(min_umi_len, len(read.umi))
+            max_umi_len = max(max_umi_len, len(read.umi))
+            if max_umi_len - min_umi_len > 1:
+                raise InvalidReadError(
+                    f"reads[{i}].umi 长度使批次 UMI 长度差超过 1；"
+                    "编辑距离模型最多允许一次插入或删除"
+                )
+            if read.umi_qualities is None:
+                raise InvalidReadError(
+                    f"reads[{i}]: 编辑距离模型处理长度为 {len(read.umi)} 的 UMI 时，"
+                    "必须提供与 UMI 等长的 umi_qualities"
+                )
+            if len(read.sequence) != read_len:
+                raise InvalidReadError(
+                    f"reads[{i}].sequence 长度 {len(read.sequence)} 与固定读段长度 {read_len} 不一致；"
+                    "编辑距离模型只允许 UMI 长度变化，不允许读段长度变化"
+                )
     assert fixed_umi_len is not None
     return fixed_umi_len, read_len
 
@@ -323,6 +425,12 @@ def cluster_umis(
     Returns:
         Cluster 元组，按 (簇总计数降序, 根 UMI 字典序) 排列。
     """
+    probe_budget, ordered = _prepare_umi_counts(umi_counts, probe_budget, variable_umi=False)
+    adjacency, _ = _build_default_adjacency(umi_counts, ordered, probe_budget)
+    return _clusters_from_adjacency(umi_counts, ordered, adjacency)
+
+
+def _prepare_umi_counts(umi_counts, probe_budget: int, *, variable_umi: bool):
     probe_budget = _strict_int("probe_budget", probe_budget)
     if probe_budget < 0:
         raise InvalidArgumentError("probe_budget 必须为非负整数")
@@ -330,9 +438,9 @@ def cluster_umis(
         raise InvalidArgumentError(
             f"umi_counts 必须是 dict，得到 {type(umi_counts).__name__}"
         )
-
-    # 独立校验键值（cluster_umis 可被直接复用）
     fixed_len: int | None = None
+    min_len: int | None = None
+    max_len = 0
     for umi, count in umi_counts.items():
         if not isinstance(umi, str):
             raise InvalidArgumentError(f"umi_counts 键必须是 str，得到 {type(umi).__name__}")
@@ -340,12 +448,23 @@ def cluster_umis(
             raise InvalidArgumentError("umi_counts 含空 UMI 键")
         if len(umi) > MAX_UMI_LENGTH:
             raise LimitExceededError(f"UMI 长度 {len(umi)} 超过上限 {MAX_UMI_LENGTH}")
-        if fixed_len is None:
-            fixed_len = len(umi)
-        elif len(umi) != fixed_len:
-            raise InvalidArgumentError(
-                f"UMI {umi!r} 长度 {len(umi)} 与固定长度 {fixed_len} 不一致"
-            )
+        if not variable_umi:
+            if fixed_len is None:
+                fixed_len = len(umi)
+            elif len(umi) != fixed_len:
+                raise InvalidArgumentError(
+                    f"UMI {umi!r} 长度 {len(umi)} 与固定长度 {fixed_len} 不一致"
+                )
+        else:
+            if min_len is None:
+                min_len = len(umi)
+                max_len = len(umi)
+            else:
+                assert min_len is not None
+                min_len = min(min_len, len(umi))
+                max_len = max(max_len, len(umi))
+                if max_len - min_len > 1:
+                    raise InvalidArgumentError("编辑距离模型中 UMI 长度差不得超过 1")
         for j, ch in enumerate(umi):
             if ch not in _BASE_INDEX:
                 raise InvalidArgumentError(f"umi_counts 键 {umi!r} 位置 {j} 含非法碱基 {ch!r}")
@@ -357,13 +476,14 @@ def cluster_umis(
         if count <= 0:
             raise InvalidArgumentError(f"umi_counts[{umi!r}] 计数必须为正整数，得到 {count}")
     if not umi_counts:
-        return ()
+        return probe_budget, ()
 
     # count 降序、再 UMI 字典序升序 —— 全局确定全序
     ordered = sorted(umi_counts, key=lambda u: (-umi_counts[u], u))
+    return probe_budget, ordered
 
-    # ---- 构造有向边 u -> v（u 在全序中先于 v）----
-    # adjacency[u] 按全序排列，保证 BFS 确定性。
+
+def _build_default_adjacency(umi_counts, ordered, probe_budget: int):
     probes = 0
     adjacency: dict[str, list[str]] = {u: [] for u in ordered}
     for ai in range(len(ordered)):
@@ -379,10 +499,13 @@ def cluster_umis(
                     probes_used=probes,
                     budget=probe_budget,
                 )
-            if _hamming1(u, v) and cu >= 2 * umi_counts[v] - 1:
+            if abs(len(u) - len(v)) == 0 and _hamming1(u, v) and cu >= 2 * umi_counts[v] - 1:
                 adjacency[u].append(v)
+    return adjacency, probes
 
-    # ---- 按全序建立根，沿有向边确定性 BFS 传递吸收 ----
+
+def _clusters_from_adjacency(umi_counts, ordered, adjacency):
+
     # owner[u]：u 已归属的根；None 表示未归属。
     owner: dict[str, str | None] = {u: None for u in ordered}
     members: dict[str, list[str]] = {}
@@ -427,6 +550,202 @@ def _hamming1(a: str, b: str) -> bool:
             if diff > 1:
                 return False
     return diff == 1
+
+
+def _validate_edit_options(options: EditDistanceOptions | None) -> EditDistanceOptions:
+    if options is None:
+        options = EditDistanceOptions()
+    if not isinstance(options, EditDistanceOptions):
+        raise InvalidArgumentError(
+            f"edit_options 必须是 EditDistanceOptions，得到 {type(options).__name__}"
+        )
+    max_d = _strict_int("max_edit_distance", options.max_edit_distance)
+    default_q = _strict_int("default_quality", options.default_quality)
+    if max_d < 1 or max_d > 2:
+        raise InvalidArgumentError("max_edit_distance 当前仅支持 1 或 2")
+    if default_q < 0 or default_q > 40:
+        raise InvalidArgumentError("default_quality 必须在 0..40")
+    gap = _reject_nonfinite("min_log10_gap", options.min_log10_gap)
+    if gap < 0:
+        raise InvalidArgumentError("min_log10_gap 必须是非负数")
+    return EditDistanceOptions(max_d, gap, default_q)
+
+
+_NEG_INF = float("-inf")
+
+
+def _log_add(x: float, y: float) -> float:
+    if x == _NEG_INF:
+        return y
+    if y == _NEG_INF:
+        return x
+    if x < y:
+        x, y = y, x
+    return x + math.log1p(10.0 ** (y - x)) / math.log(10.0)
+
+
+def _edit_log_terms(q: int) -> tuple[float, float, float, float]:
+    err = 10.0 ** (-q / 10.0)
+    correct = 1.0 - err
+    return (
+        _NEG_INF if correct == 0.0 else math.log10(correct),
+        math.log10(err / 9.0),
+        math.log10(err / 12.0),
+        math.log10(err / 3.0),
+    )
+
+
+_EDIT_TERM_TABLE = tuple(_edit_log_terms(q) for q in range(41))
+
+
+def shortest_edit_evidence(root: str, observed: str, qualities: tuple[int, ...]):
+    """返回 root 生成 observed 的 (最小编辑数, 全部最短路径 log10 概率和, 路径数)。"""
+    for name, value in (("root", root), ("observed", observed)):
+        if not isinstance(value, str):
+            raise InvalidArgumentError(f"{name} 必须是 str")
+        for pos, base in enumerate(value):
+            if base not in _BASE_INDEX:
+                raise InvalidArgumentError(f"{name}[{pos}] 非法，仅允许 A/C/G/T")
+        if not value:
+            raise InvalidArgumentError(f"{name} 不能为空")
+        if len(value) > MAX_UMI_LENGTH:
+            raise LimitExceededError(f"{name} 长度超过上限 {MAX_UMI_LENGTH}")
+    if len(qualities) != len(observed):
+        raise InvalidArgumentError("UMI qualities 必须与观测 UMI 等长")
+    for pos, quality in enumerate(qualities):
+        if isinstance(quality, bool) or not isinstance(quality, int):
+            raise InvalidArgumentError(f"qualities[{pos}] 必须是 0..40 的整数且不能是 bool")
+        if quality < 0 or quality > 40:
+            raise InvalidArgumentError(f"qualities[{pos}] = {quality} 越界，允许范围 0..40")
+    m, n = len(root), len(observed)
+    dist = [[10**9] * (n + 1) for _ in range(m + 1)]
+    logp = [[_NEG_INF] * (n + 1) for _ in range(m + 1)]
+    paths = [[0] * (n + 1) for _ in range(m + 1)]
+    dist[0][0] = 0
+    logp[0][0] = 0.0
+    paths[0][0] = 1
+
+    def relax(i, j, previous_distance, previous_log, previous_paths, added_distance, term):
+        candidate_distance = previous_distance + added_distance
+        candidate_log = previous_log + term
+        if candidate_distance < dist[i][j]:
+            dist[i][j] = candidate_distance
+            logp[i][j] = candidate_log
+            paths[i][j] = previous_paths
+        elif candidate_distance == dist[i][j]:
+            logp[i][j] = _log_add(logp[i][j], candidate_log)
+            paths[i][j] += previous_paths
+
+    for i in range(m + 1):
+        for j in range(n + 1):
+            if i == 0 and j == 0:
+                continue
+            if i > 0 and j > 0:
+                q = qualities[j - 1]
+                log_match, log_sub, _, _ = _EDIT_TERM_TABLE[q]
+                if root[i - 1] == observed[j - 1]:
+                    relax(i, j, dist[i-1][j-1], logp[i-1][j-1], paths[i-1][j-1], 0, log_match)
+                else:
+                    relax(i, j, dist[i-1][j-1], logp[i-1][j-1], paths[i-1][j-1], 1, log_sub)
+            if i > 0:
+                anchor_q = qualities[min(j, n - 1)]
+                _, _, _, log_delete = _EDIT_TERM_TABLE[anchor_q]
+                relax(i, j, dist[i-1][j], logp[i-1][j], paths[i-1][j], 1, log_delete)
+            if j > 0:
+                _, _, log_insert, _ = _EDIT_TERM_TABLE[qualities[j - 1]]
+                relax(i, j, dist[i][j-1], logp[i][j-1], paths[i][j-1], 1, log_insert)
+    return dist[m][n], logp[m][n], paths[m][n]
+
+
+def _quality_records_for(umi, groups, quality_records, default_quality):
+    if quality_records is None or umi not in quality_records:
+        count = len(groups[umi]) if groups is not None else 1
+        return [tuple([default_quality] * len(umi)) for _ in range(count)]
+    records = list(quality_records[umi])
+    if groups is not None and len(records) != len(groups[umi]):
+        raise InvalidArgumentError(f"UMI {umi!r} 的 UMI 质量记录数与读段数不一致")
+    out = []
+    for k, record in enumerate(records):
+        if record is None:
+            out.append(tuple([default_quality] * len(umi)))
+        else:
+            if len(record) != len(umi):
+                raise InvalidArgumentError(f"UMI {umi!r} 第 {k} 条 UMI 质量长度不一致")
+            out.append(tuple(record))
+    return out
+
+
+def cluster_umis_with_edit_distance(
+    umi_counts: dict[str, int],
+    quality_records=None,
+    *,
+    edit_options: EditDistanceOptions | None = None,
+    probe_budget: int = DEFAULT_PROBE_BUDGET,
+) -> EditClusteringResult:
+    """用短编辑距离和碱基质量执行可选吸收。"""
+    options = _validate_edit_options(edit_options)
+    probe_budget, ordered = _prepare_umi_counts(umi_counts, probe_budget, variable_umi=True)
+    probes = 0
+    adjacency: dict[str, list[str]] = {u: [] for u in ordered}
+    assignments: list[EditAssignment] = []
+
+    for vi, child in enumerate(ordered):
+        candidates = []
+        expected_count = umi_counts[child]
+        child_records = []
+        if vi:
+            if quality_records is None or child not in quality_records:
+                child_records = [tuple([options.default_quality] * len(child)) for _ in range(expected_count)]
+            else:
+                child_records = _quality_records_for(child, None, quality_records, options.default_quality)
+                if len(child_records) != expected_count:
+                    raise InvalidArgumentError(f"UMI {child!r} 的 UMI 质量记录数与计数不一致")
+        for root in ordered[:vi]:
+            if umi_counts[root] < 2 * expected_count - 1:
+                continue
+            probes += 1
+            if probes > probe_budget:
+                raise SearchBudgetExhaustedError(
+                    f"编辑距离候选探测预算耗尽（已用 {probes}，预算 {probe_budget}）",
+                    probes_used=probes,
+                    budget=probe_budget,
+                )
+            if abs(len(root) - len(child)) > 1:
+                continue
+            total_log = 0.0
+            distance = 10**9
+            path_count = 1
+            valid = True
+            for qualities in child_records:
+                distance, one_log, one_paths = shortest_edit_evidence(root, child, qualities)
+                if distance > options.max_edit_distance:
+                    valid = False
+                    break
+                total_log += one_log
+                path_count *= one_paths
+            if valid:
+                candidates.append(EditCandidate(root, distance, total_log, path_count))
+
+        candidates.sort(key=lambda c: (-c.log10_probability, c.edit_distance, c.root))
+        state = "independent"
+        assigned = None
+        gap = None
+        if candidates:
+            best = candidates[0]
+            second_log = candidates[1].log10_probability if len(candidates) > 1 else _NEG_INF
+            gap = best.log10_probability - second_log
+            if gap >= options.min_log10_gap:
+                state = "merged"
+                assigned = best.root
+                adjacency[best.root].append(child)
+            else:
+                state = "ambiguous"
+        assignments.append(EditAssignment(child, state, assigned, tuple(candidates), gap))
+
+    for edges in adjacency.values():
+        edges.sort(key=lambda u: (-umi_counts[u], u))
+    clusters = _clusters_from_adjacency(umi_counts, ordered, adjacency)
+    return EditClusteringResult(clusters=clusters, assignments=tuple(assignments))
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +835,7 @@ def analyze_reads(
     reads,
     *,
     probe_budget: int = DEFAULT_PROBE_BUDGET,
+    edit_options: EditDistanceOptions | None = None,
 ) -> AnalysisResult:
     """对整批读段执行 校验 → UMI 计数 → 吸收聚类 → 逐簇共识。
 
@@ -525,15 +845,33 @@ def analyze_reads(
     Returns:
         :class:`AnalysisResult`。
     """
+    edit_mode = edit_options is not None
+    if edit_mode:
+        validated_edit_options = _validate_edit_options(edit_options)
+
     # 1) 整批先校验（原子失败语义）
-    umi_len, read_len = _validate_batch(reads)
+    umi_len, read_len = _validate_batch(reads, variable_umi=edit_mode)
 
     # 2) 分组计数
     groups = _group_by_umi(reads)
     umi_counts = {u: len(v) for u, v in groups.items()}
 
     # 3) 吸收聚类
-    clusters = cluster_umis(umi_counts, probe_budget=probe_budget)
+    edit_assignments = ()
+    if edit_mode:
+        quality_records = {}
+        for read in reads:
+            quality_records.setdefault(read.umi, []).append(read.umi_qualities)
+        edit_result = cluster_umis_with_edit_distance(
+            umi_counts,
+            quality_records,
+            edit_options=validated_edit_options,
+            probe_budget=probe_budget,
+        )
+        clusters = edit_result.clusters
+        edit_assignments = edit_result.assignments
+    else:
+        clusters = cluster_umis(umi_counts, probe_budget=probe_budget)
     nodes_before = len(umi_counts)
 
     # 4) 逐簇共识
@@ -561,4 +899,5 @@ def analyze_reads(
         read_length=read_len,
         nodes_before=nodes_before,
         molecules_after=len(molecules),
+        edit_assignments=edit_assignments,
     )

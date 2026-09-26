@@ -1,7 +1,9 @@
 # umicorrect —— UMI 测序分子的错误吸收与共识
 
-离线、纯标准库实现的可复用题库：对固定长度 UMI + 等长 DNA 读段的批次做
-**UMI 错误吸收聚类** 与 **逐碱基质量加权对数似然共识**。
+离线、纯标准库实现的可复用题库：对 UMI + 固定长度 DNA 读段的批次做
+**UMI 错误吸收聚类** 与 **逐碱基质量加权对数似然共识**。默认模型仍是
+固定长度 Hamming 规则；本轮新增显式可选的短编辑距离模型，支持最多 2 次
+替换、插入或删除，并在证据接近时保留歧义 UMI。
 
 - **Python 版本**：Python 3.14.7（Linux 原生开发验证；3.10+ 语法即可运行，但验收以 3.14.7 为准）
 - **依赖**：无第三方依赖，仅标准库（`math`、`dataclasses`）。安装 Python 后直接运行，无需联网、无需账号/密钥/数据库/中间件/Docker。
@@ -10,20 +12,33 @@
 ## 准确命令
 
 ```bash
-# 必要测试（42 个用例：手算似然、穷举小有向图参考、丰度桥、相等根、低质量多数、空读段拒绝等）
+python3.14 -m venv .venv
+source .venv/bin/activate
+
+# 必要测试（49 个用例：原 42 个回归 + 编辑距离独立枚举与歧义用例）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.03 秒，远小于 8 秒；真实计算，无 sleep、无预录结果）
 python demo.py
+python demo_iteration.py
 ```
 
 ## 公开接口
 
 ```python
-from umicorrect import Read, analyze_reads, cluster_umis, consensus
+from umicorrect import Read, EditDistanceOptions, analyze_reads, cluster_umis, consensus
 
 read = Read(umi="AAA", sequence="ACG", qualities=(30, 25, 20))
-result = analyze_reads([read, ...], probe_budget=200_000_000)
+result = analyze_reads([read, ...])  # 默认保持原 Hamming 行为
+
+# 编辑模式中，变长 UMI 需提供 umi_qualities；sequence 仍全批次等长。
+edit_result = analyze_reads(
+    [read, ...],
+    edit_options=EditDistanceOptions(max_edit_distance=2, min_log10_gap=1.0),
+)
+for decision in edit_result.edit_assignments:
+    decision.state          # merged、ambiguous 或 independent
+    decision.assigned_root  # 歧义保留时为 None
+    decision.best_gap       # 最佳/次佳 log10 概率差
 
 result.nodes_before      # 合并前分子数 = 去重 UMI 种数
 result.molecules_after   # 合并后分子数（簇数）
@@ -41,10 +56,34 @@ for mol in result.molecules:
 | 接口 | 输入 | 输出 | 说明 |
 |---|---|---|---|
 | `cluster_umis(umi_counts, *, probe_budget=...)` | `dict[str, int]`（UMI→正整数计数） | `tuple[Cluster, ...]` | 只做有向吸收聚类 |
+| `cluster_umis_with_edit_distance(...)` | UMI 计数 + 每条 UMI 质量 | `EditClusteringResult` | 可选编辑距离聚类与候选证据 |
+| `shortest_edit_evidence(root, observed, qualities)` | 根 UMI、观测 UMI、观测质量 | `(距离, log10概率和, 路径数)` | 全部最短编辑路径求和 |
 | `consensus(reads, read_length, *, read_indices)` | 批次 + 一簇读段下标 | `(共识序列, 逐位置gap)` | 只做对数似然共识 |
-| `analyze_reads(reads, *, probe_budget=...)` | `list[Read]` | `AnalysisResult` | 校验→计数→吸收→共识 |
+| `analyze_reads(reads, *, probe_budget=..., edit_options=None)` | `list[Read]` | `AnalysisResult` | 默认 Hamming；传选项启用编辑模型 |
 
 `Cluster` 字段：`root`、`members`、`root_count`、`total_count`。
+
+`EditAssignment` 字段：`umi`、`state`、`assigned_root`、`candidates`、
+`best_gap`；`EditCandidate` 字段：`root`、`edit_distance`、
+`log10_probability`、`path_count`。
+
+### 可选编辑距离接口约定
+
+`Read(umi, sequence, qualities, umi_qualities=None)` 默认保持原契约。
+启用编辑模式后，全批次 sequence 仍固定等长；UMI 长度彼此最多相差 1，并且
+每条读段必须提供与该 UMI 等长的 `umi_qualities`。候选仍先按丰度方向筛
+选：根必须位于 `(count 降序, UMI 升序)` 全序之前，且满足原有
+`count[root] >= 2*count[child]-1`，然后才计算编辑距离。
+
+路径模型固定为局部事件概率，`e=10^(-Q/10)`：匹配 `1-e`；替换成某个指
+定碱基 `e/9`；插入某个指定碱基 `e/12`；删除 `e/3`。删除质量取删除位置
+右侧锚定观测碱基的 Q，末端删除取最后一个观测碱基 Q。网格 DP 同时保存
+最小距离、路径数和这些路径的概率对数和；同聚体的多个等价位置全部累计，
+不依赖候选遍历顺序。
+
+多条相同观测 UMI 的候选分数为各读段路径概率和之积。最佳与次佳候选的
+log10 概率差**小于** `min_log10_gap` 时状态为 `ambiguous` 并保留独立；
+差等于阈值时允许归并。没有可达候选也保留独立。
 
 ## 算法与契约
 
@@ -84,7 +123,8 @@ BFS，所有可达且未归属的节点归入该簇（允许 `R→X→Y` 式传�
 | 参数 | 上限/范围 |
 |---|---|
 | UMI 长度 | 1..32 |
-| 读段长度 | 1..1000，且与 UMI 等长 |
+| 读段长度 | 1..1000，全批次等长；默认模式还要求与 UMI 等长 |
+| 编辑模式 UMI | 长度 1..32，批次内长度差最多 1，最小编辑距离 1..2 |
 | 批次数 | ≤ 1,000,000 条 |
 | 单碱基质量 Q | 整数 0..40 |
 | 字母表 | UMI 与序列均仅允许大写 A/C/G/T（拒绝 N 与小写） |
@@ -138,6 +178,9 @@ O(K²)。
     另加 300 个长度 4 的确定性随机实例；
   - 丰度桥（含桥后再挂下游错误 UMI）、相等根（2 与 2 不合、1 与 1 合）、
     吸收阈值 `2s-1` 的恰好边界两侧、传递链、成员/分子排序、预算语义。
+- `tests/test_edit_distance.py`：长度 1..3 的所有短串独立 DFS 枚举编辑路
+  径、同聚体插入/删除等价路径数、长度差 1、两个高丰度候选并列、输入置
+  换不变性、正常归并和歧义状态。
 - `tests/test_pipeline.py`：端到端分子数变化、40 个随机批次对独立参考、
   输入重排确定性、空批次/空字段拒绝与定位、原子失败、上限异常类型、
   预算耗尽≠无解。
@@ -159,8 +202,8 @@ O(K²)。
 
 ## 已知限制
 
-- 仅支持固定长度 UMI 与等长读段；不支持变长 UMI、插入/缺失（indel）
-  造成的长度变化。
+- 默认模式仅支持固定长度 UMI 与等长读段；可选编辑模式仅覆盖短 UMI
+  （长度差最多 1、总编辑数最多 2），不是任意长度全局序列比对器。
 - 错误模型为“每位置独立、错误均匀分给其余 3 种碱基”；不建模上下文
   相关错误率、链特异性、双重 UMI 或 UMI 接头结构。
 - 共识序列不输出 IUPAC 模糊码，证据并列一律 N；Q=0 呼中碱基似然为 -∞。
@@ -172,8 +215,9 @@ O(K²)。
 ## 仓库结构
 
 ```
-umicorrect/          本题库（errors.py 异常；core.py 核心算法）
-tests/               unittest 用例 + 独立参考 reference.py
-demo.py              固定输入演示
+umicorrect/            本题库（errors.py 异常；core.py 核心算法）
+tests/                 unittest 用例 + 独立参考 reference.py
+demo.py                原固定输入演示
+demo_iteration.py      编辑距离、路径求和与歧义边界演示
 requirements.txt     无第三方依赖（仅注释说明）
 ```
